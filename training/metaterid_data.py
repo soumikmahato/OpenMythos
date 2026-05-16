@@ -232,8 +232,16 @@ def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[
     if source.config:
         kwargs["name"] = source.config
 
+    ds = load_dataset(**kwargs)
     total_shards, shard_index = _rank_worker_shard(rank, world_size)
-    ds = load_dataset(**kwargs).shard(num_shards=total_shards, index=shard_index)
+    try:
+        ds = ds.shard(num_shards=total_shards, index=shard_index)
+    except IndexError:
+        # Some streaming datasets expose fewer physical data sources than the
+        # number of DDP ranks x DataLoader workers. Fall back to rank-level
+        # sharding so the dataset stays usable in small Kaggle smoke runs.
+        safe_index = rank % max(1, world_size)
+        ds = ds.shard(num_shards=max(1, world_size), index=safe_index)
     for sample in ds:
         text = _format_sample(sample, source)
         if text.strip():
