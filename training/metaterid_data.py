@@ -72,6 +72,7 @@ METATERID_T4_PILOT_MIX = [
         name="multilingual_fineweb2_hq",
         weight=0.02,
         dataset="epfml/FineWeb2-HQ",
+        config="deu_Latn",
         split="train",
         text_field="text",
         formatter="text",
