@@ -21,6 +21,7 @@ class DataSource:
     text_field: str = "text"
     local_jsonl: str | None = None
     formatter: str = "auto"
+    fallback: "DataSource | None" = None
 
 
 METATERID_T4_PILOT_MIX = [
@@ -37,6 +38,13 @@ METATERID_T4_PILOT_MIX = [
         dataset="bigcode/starcoderdata",
         split="train",
         text_field="content",
+        fallback=DataSource(
+            name="small_stack_smol_code_fallback",
+            weight=0.10,
+            dataset="bigcode/the-stack-smol",
+            split="train",
+            text_field="content",
+        ),
     ),
     DataSource(
         name="math_stem",
@@ -124,6 +132,7 @@ def normalize_weights(sources: list[DataSource]) -> list[DataSource]:
             text_field=source.text_field,
             local_jsonl=source.local_jsonl,
             formatter=source.formatter,
+            fallback=source.fallback,
         )
         for source in sources
     ]
@@ -229,7 +238,21 @@ def iter_source_text(source: DataSource, rank: int, world_size: int) -> Iterator
         return _iter_local_jsonl(Path(source.local_jsonl), source)
     if source.dataset is None:
         return iter(())
-    return _iter_hf_stream(source, rank, world_size)
+    if source.fallback is None:
+        return _iter_hf_stream(source, rank, world_size)
+
+    def _with_fallback() -> Iterator[str]:
+        try:
+            yield from _iter_hf_stream(source, rank, world_size)
+        except Exception as exc:
+            print(
+                f"[metaterid_data] Source {source.name} failed with {type(exc).__name__}: {exc}. "
+                f"Falling back to {source.fallback.name}.",
+                flush=True,
+            )
+            yield from iter_source_text(source.fallback, rank, world_size)
+
+    return _with_fallback()
 
 
 class MixedTokenDataset(IterableDataset):

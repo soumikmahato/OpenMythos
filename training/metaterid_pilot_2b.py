@@ -139,7 +139,12 @@ def main() -> None:
                 logger.info(f"Resumed model from {latest} at {tokens_seen:,} tokens")
 
     if ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     optimizer = build_optimizer(
         model,
