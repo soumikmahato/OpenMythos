@@ -17,8 +17,10 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from loguru import logger
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
@@ -62,6 +64,10 @@ def _save_checkpoint(
     os.replace(tmp, path)
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
 def _latest_checkpoint(path: Path) -> Path | None:
     ckpts = sorted(path.glob("tokens_*.pt"))
     return ckpts[-1] if ckpts else None
@@ -89,11 +95,27 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP training requires CUDA devices.")
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        rank = local_rank = 0
+        world_size = 1
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    master = rank == 0
+    torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
+
+    if "cuda" in device:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     tokenizer = MetaTeridTokenizer(args.tokenizer)
@@ -101,7 +123,24 @@ def main() -> None:
     cfg.vocab_size = tokenizer.vocab_size
     cfg.max_seq_len = args.seq_len
 
+    start_step = 0
+    tokens_seen = 0
+    ckpt_dir = Path(args.ckpt_dir)
+
     model = MetaTeridForCausalLM(cfg).to(device)
+    if args.resume:
+        latest = _latest_checkpoint(ckpt_dir)
+        if latest is not None:
+            ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+            model.load_state_dict(ckpt["model"])
+            start_step = int(ckpt["step"])
+            tokens_seen = int(ckpt["tokens_seen"])
+            if master:
+                logger.info(f"Resumed model from {latest} at {tokens_seen:,} tokens")
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     optimizer = build_optimizer(
         model,
         name=args.optimizer,
@@ -109,33 +148,30 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    start_step = 0
-    tokens_seen = 0
-    ckpt_dir = Path(args.ckpt_dir)
     if args.resume:
         latest = _latest_checkpoint(ckpt_dir)
         if latest is not None:
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
-            model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
-            start_step = int(ckpt["step"])
-            tokens_seen = int(ckpt["tokens_seen"])
-            logger.info(f"Resumed from {latest} at {tokens_seen:,} tokens")
+            if master:
+                logger.info("Resumed optimizer state")
 
     dataset = MixedTokenDataset(
         tokenizer,
         args.seq_len,
         METATERID_T4_PILOT_MIX,
+        rank=rank,
+        world_size=world_size,
         seed=args.seed,
     )
     loader = DataLoader(
         dataset,
         batch_size=args.micro_batch,
         num_workers=args.num_workers,
-        pin_memory=(device == "cuda"),
+        pin_memory=("cuda" in device),
     )
 
-    global_batch_tokens = args.micro_batch * args.grad_accum * args.seq_len
+    global_batch_tokens = world_size * args.micro_batch * args.grad_accum * args.seq_len
     total_steps = math.ceil(args.target_tokens / global_batch_tokens)
     amp_dtype = torch.float16
     amp_ctx = (
@@ -144,11 +180,12 @@ def main() -> None:
         else nullcontext()
     )
 
-    logger.info(
-        f"device={device} seq_len={args.seq_len} micro_batch={args.micro_batch} "
-        f"grad_accum={args.grad_accum} global_batch_tokens={global_batch_tokens:,} "
-        f"total_steps={total_steps:,}"
-    )
+    if master:
+        logger.info(
+            f"ddp={ddp} world_size={world_size} device={device} seq_len={args.seq_len} "
+            f"micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
+            f"global_batch_tokens={global_batch_tokens:,} total_steps={total_steps:,}"
+        )
 
     milestone_index = 0
     while milestone_index < len(TOKEN_MILESTONES) and tokens_seen >= TOKEN_MILESTONES[milestone_index]:
@@ -165,13 +202,18 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
-        for _ in range(args.grad_accum):
+        for micro_step in range(args.grad_accum):
             x, y = next(data_iter)
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             n_loops = random.randint(cfg.train_min_loops, cfg.train_max_loops)
 
-            with amp_ctx:
+            sync_ctx = (
+                model.no_sync()
+                if ddp and micro_step < args.grad_accum - 1
+                else nullcontext()
+            )
+            with sync_ctx, amp_ctx:
                 logits = model(x, n_loops=n_loops)
                 loss = F.cross_entropy(logits.view(-1, cfg.vocab_size), y.view(-1))
                 loss = loss / args.grad_accum
@@ -183,7 +225,7 @@ def main() -> None:
         optimizer.step()
         tokens_seen += global_batch_tokens
 
-        if (step + 1) % args.log_every == 0:
+        if master and (step + 1) % args.log_every == 0:
             dt = time.perf_counter() - t0
             tok_per_sec = global_batch_tokens * args.log_every / max(dt, 1e-6)
             logger.info(
@@ -196,30 +238,38 @@ def main() -> None:
         while milestone_index < len(TOKEN_MILESTONES) and tokens_seen >= TOKEN_MILESTONES[milestone_index]:
             milestone = TOKEN_MILESTONES[milestone_index]
             path = ckpt_dir / f"tokens_{milestone:013d}.pt"
-            _save_checkpoint(
-                path,
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                step=step + 1,
-                tokens_seen=tokens_seen,
-            )
-            logger.success(f"Saved milestone checkpoint {path}")
+            if master:
+                _save_checkpoint(
+                    path,
+                    model=_unwrap_model(model),
+                    optimizer=optimizer,
+                    cfg=cfg,
+                    step=step + 1,
+                    tokens_seen=tokens_seen,
+                )
+                logger.success(f"Saved milestone checkpoint {path}")
+            if ddp:
+                dist.barrier()
             milestone_index += 1
 
         if tokens_seen >= args.target_tokens:
             break
 
     final_path = ckpt_dir / "final.pt"
-    _save_checkpoint(
-        final_path,
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        step=step + 1,
-        tokens_seen=tokens_seen,
-    )
-    logger.success(f"Training complete. Final checkpoint: {final_path}")
+    if master:
+        _save_checkpoint(
+            final_path,
+            model=_unwrap_model(model),
+            optimizer=optimizer,
+            cfg=cfg,
+            step=step + 1,
+            tokens_seen=tokens_seen,
+        )
+        logger.success(f"Training complete. Final checkpoint: {final_path}")
+
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
