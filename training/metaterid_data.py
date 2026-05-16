@@ -44,6 +44,13 @@ METATERID_T4_PILOT_MIX = [
             dataset="bigcode/the-stack-smol",
             split="train",
             text_field="content",
+            fallback=DataSource(
+                name="codeparrot_clean_code_fallback",
+                weight=0.10,
+                dataset="codeparrot/codeparrot-clean",
+                split="train",
+                text_field="content",
+            ),
         ),
     ),
     DataSource(
