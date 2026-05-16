@@ -70,6 +70,9 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def _latest_checkpoint(path: Path) -> Path | None:
     ckpts = sorted(path.glob("tokens_*.pt"))
+    final = path / "final.pt"
+    if final.exists():
+        return final
     return ckpts[-1] if ckpts else None
 
 
