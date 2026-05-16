@@ -166,6 +166,20 @@ Key design choices:
 | Schedule | Linear warmup (2000 steps) → cosine decay |
 | Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
 
+### MetaTerid Tokenizer
+
+MetaTerid uses a custom byte-level BPE tokenizer named
+`metaterid-tokenizer-v1` with a target vocabulary size of `65,536`, including
+reserved chat, thinking, tool, and fill-in-the-middle tokens. Train it with:
+
+```bash
+python training/train_metaterid_tokenizer.py data/**/*.txt \
+  --output-dir tokenizers/metaterid-tokenizer-v1
+```
+
+See [`docs/metaterid_tokenizer.md`](docs/metaterid_tokenizer.md) for the
+reserved token list and training notes.
+
 ---
 
 ## Documentation
@@ -174,6 +188,7 @@ Key design choices:
 |---|---|
 | [`docs/open_mythos.md`](docs/open_mythos.md) | Full API reference for the `OpenMythos` class — constructor, `forward`, `generate`, all sub-modules, configuration reference, and usage examples |
 | [`docs/datasets.md`](docs/datasets.md) | Recommended training datasets with token budget guidance per model size |
+| [`docs/metaterid_tokenizer.md`](docs/metaterid_tokenizer.md) | MetaTerid tokenizer target, reserved tokens, and local training command |
 
 ---
 

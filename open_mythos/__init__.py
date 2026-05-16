@@ -16,6 +16,20 @@ from open_mythos.main import (
     precompute_rope_freqs,
 )
 from open_mythos.tokenizer import MythosTokenizer
+from open_mythos.metaterid_tokenizer import (
+    METATERID_SPECIAL_TOKENS,
+    METATERID_TOKENIZER_NAME,
+    METATERID_VOCAB_SIZE,
+    MetaTeridTokenizer,
+    train_metaterid_tokenizer,
+)
+from open_mythos.metaterid import (
+    BlockAttentionResidual,
+    MetaTeridConfig,
+    MetaTeridForCausalLM,
+    metaterid_1b,
+    metaterid_t4_pilot,
+)
 from open_mythos.variants import (
     mythos_1b,
     mythos_1t,
@@ -52,4 +66,14 @@ __all__ = [
     "load_tokenizer",
     "get_vocab_size",
     "MythosTokenizer",
+    "METATERID_TOKENIZER_NAME",
+    "METATERID_VOCAB_SIZE",
+    "METATERID_SPECIAL_TOKENS",
+    "MetaTeridTokenizer",
+    "train_metaterid_tokenizer",
+    "BlockAttentionResidual",
+    "MetaTeridConfig",
+    "MetaTeridForCausalLM",
+    "metaterid_1b",
+    "metaterid_t4_pilot",
 ]
