@@ -27,7 +27,7 @@ class DataSource:
 METATERID_T4_PILOT_MIX = [
     DataSource(
         name="filtered_fineweb_edu",
-        weight=0.65,
+        weight=0.60,
         dataset="HuggingFaceFW/fineweb-edu",
         config="sample-10BT",
         text_field="text",
@@ -55,22 +55,30 @@ METATERID_T4_PILOT_MIX = [
     ),
     DataSource(
         name="math_stem",
-        weight=0.08,
+        weight=0.10,
         dataset="open-web-math/open-web-math",
         split="train",
         text_field="text",
     ),
     DataSource(
         name="reference_wiki",
-        weight=0.07,
+        weight=0.06,
         dataset="wikimedia/wikipedia",
         config="20231101.en",
         split="train",
         text_field="text",
     ),
     DataSource(
+        name="instruction_openhermes_25",
+        weight=0.06,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+    DataSource(
         name="instruction_tulu3_personas_if",
-        weight=0.05,
+        weight=0.03,
         dataset="allenai/tulu-3-sft-personas-instruction-following",
         split="train",
         text_field="messages",
