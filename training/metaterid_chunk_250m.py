@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--micro-batch", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--nproc-per-node", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")

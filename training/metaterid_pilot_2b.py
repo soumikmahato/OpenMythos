@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adam", "muon"])
-    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=1337)
