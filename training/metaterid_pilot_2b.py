@@ -9,6 +9,7 @@ checkpoints at 10M, 100M, 500M, 1B, and 2B tokens.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -66,6 +67,10 @@ def _save_checkpoint(
         tmp,
     )
     os.replace(tmp, path)
+    path.with_suffix(".json").write_text(
+        json.dumps({"step": step, "tokens_seen": tokens_seen}, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -96,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-optimizer",
+        action="store_true",
+        help="Also resume Adam optimizer state. Disabled by default to reduce Kaggle RAM pressure.",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--mix",
@@ -166,13 +176,15 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    if args.resume:
+    if args.resume and args.resume_optimizer:
         latest = _latest_checkpoint(ckpt_dir)
         if latest is not None:
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             optimizer.load_state_dict(ckpt["optimizer"])
             if master:
                 logger.info("Resumed optimizer state")
+    elif args.resume and master:
+        logger.info("Resumed model weights only; optimizer state reset for this chunk")
 
     sources = (
         METATERID_T4_KAGGLE_CHUNK_MIX

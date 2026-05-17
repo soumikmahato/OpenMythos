@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,17 +11,29 @@ import torch
 
 
 def _latest_tokens(ckpt_dir: Path) -> int:
+    final_meta = ckpt_dir / "final.json"
+    if final_meta.exists():
+        return int(json.loads(final_meta.read_text(encoding="utf-8")).get("tokens_seen", 0))
+
     final = ckpt_dir / "final.pt"
     if final.exists():
         ckpt = torch.load(final, map_location="cpu", weights_only=False)
-        return int(ckpt.get("tokens_seen", 0))
+        tokens_seen = int(ckpt.get("tokens_seen", 0))
+        del ckpt
+        return tokens_seen
 
     token_ckpts = sorted(ckpt_dir.glob("tokens_*.pt"))
     if not token_ckpts:
         return 0
 
+    meta = token_ckpts[-1].with_suffix(".json")
+    if meta.exists():
+        return int(json.loads(meta.read_text(encoding="utf-8")).get("tokens_seen", 0))
+
     ckpt = torch.load(token_ckpts[-1], map_location="cpu", weights_only=False)
-    return int(ckpt.get("tokens_seen", 0))
+    tokens_seen = int(ckpt.get("tokens_seen", 0))
+    del ckpt
+    return tokens_seen
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--nproc-per-node", type=int, default=2)
     parser.add_argument(
+        "--current-tokens",
+        type=int,
+        default=None,
+        help="Known current token count. Use this on Kaggle to avoid loading final.pt in the launcher.",
+    )
+    parser.add_argument(
+        "--resume-optimizer",
+        action="store_true",
+        help="Forward --resume-optimizer to the training script. Off by default for Kaggle RAM safety.",
+    )
+    parser.add_argument(
         "--mix",
         default="kaggle_chunk",
         choices=["pilot", "kaggle_chunk"],
@@ -50,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     ckpt_dir = Path(args.ckpt_dir)
-    tokens_seen = _latest_tokens(ckpt_dir)
+    tokens_seen = args.current_tokens if args.current_tokens is not None else _latest_tokens(ckpt_dir)
     if tokens_seen >= args.max_tokens:
         print(f"Run already reached {tokens_seen:,} tokens >= {args.max_tokens:,}.")
         return
@@ -84,6 +108,8 @@ def main() -> None:
     ]
     if tokens_seen > 0:
         command.append("--resume")
+    if args.resume_optimizer:
+        command.append("--resume-optimizer")
 
     print(f"Current tokens: {tokens_seen:,}")
     print(f"Target tokens after this chunk: {target_tokens:,}")
