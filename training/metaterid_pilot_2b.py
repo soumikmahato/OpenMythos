@@ -9,6 +9,7 @@ checkpoints at 10M, 100M, 500M, 1B, and 2B tokens.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -27,13 +28,42 @@ from torch.utils.data import DataLoader
 from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 from training.metaterid_data import (
+    METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX,
     METATERID_T4_KAGGLE_CHUNK_MIX,
+    METATERID_T4_KAGGLE_NO_MATH_MIX,
     METATERID_T4_PILOT_MIX,
     MixedTokenDataset,
 )
 from training.metaterid_optim import build_optimizer
 
 TOKEN_MILESTONES = (10_000_000, 100_000_000, 500_000_000, 1_000_000_000, 2_000_000_000)
+
+
+def _memory_summary() -> str:
+    if os.name != "posix":
+        return "memory=unavailable"
+    try:
+        rss_kb = 0
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+        available_kb = 0
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    available_kb = int(line.split()[1])
+                    break
+        cuda = ""
+        if torch.cuda.is_available():
+            cuda = (
+                f" cuda_alloc={torch.cuda.memory_allocated() / 1024 ** 3:.2f}GiB"
+                f" cuda_reserved={torch.cuda.memory_reserved() / 1024 ** 3:.2f}GiB"
+            )
+        return f"rss={rss_kb / 1024 ** 2:.2f}GiB mem_avail={available_kb / 1024 ** 2:.2f}GiB{cuda}"
+    except Exception as exc:
+        return f"memory=unavailable:{type(exc).__name__}"
 
 
 def get_lr(step: int, warmup: int, total: int, max_lr: float, min_lr: float) -> float:
@@ -119,9 +149,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mix",
         default="pilot",
-        choices=["pilot", "kaggle_chunk"],
+        choices=["pilot", "kaggle_chunk", "kaggle_fineweb_only", "kaggle_no_math"],
         help="Dataset mix preset. Use kaggle_chunk for memory-safe Kaggle continuation.",
     )
+    parser.add_argument("--log-memory", action="store_true")
     return parser.parse_args()
 
 
@@ -167,8 +198,12 @@ def main() -> None:
             model.load_state_dict(ckpt["model"])
             start_step = int(ckpt["step"])
             tokens_seen = int(ckpt["tokens_seen"])
+            del ckpt
+            gc.collect()
             if master:
                 logger.info(f"Resumed model from {latest} at {tokens_seen:,} tokens")
+                if args.log_memory:
+                    logger.info(f"memory after resume: {_memory_summary()}")
 
     if ddp:
         model = DDP(
@@ -190,16 +225,21 @@ def main() -> None:
         if latest is not None:
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             optimizer.load_state_dict(ckpt["optimizer"])
+            del ckpt
+            gc.collect()
             if master:
                 logger.info("Resumed optimizer state")
     elif args.resume and master:
         logger.info("Resumed model weights only; optimizer state reset for this chunk")
 
-    sources = (
-        METATERID_T4_KAGGLE_CHUNK_MIX
-        if args.mix == "kaggle_chunk"
-        else METATERID_T4_PILOT_MIX
-    )
+    if args.mix == "kaggle_chunk":
+        sources = METATERID_T4_KAGGLE_CHUNK_MIX
+    elif args.mix == "kaggle_fineweb_only":
+        sources = METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX
+    elif args.mix == "kaggle_no_math":
+        sources = METATERID_T4_KAGGLE_NO_MATH_MIX
+    else:
+        sources = METATERID_T4_PILOT_MIX
     dataset = MixedTokenDataset(
         tokenizer,
         args.seq_len,
@@ -231,6 +271,8 @@ def main() -> None:
             f"micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
             f"global_batch_tokens={global_batch_tokens:,} total_steps={total_steps:,}"
         )
+        if args.log_memory:
+            logger.info(f"memory before training loop: {_memory_summary()}")
 
     milestone_index = 0
     while milestone_index < len(TOKEN_MILESTONES) and tokens_seen >= TOKEN_MILESTONES[milestone_index]:
@@ -269,6 +311,9 @@ def main() -> None:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         tokens_seen += global_batch_tokens
+
+        if master and args.log_memory:
+            logger.info(f"memory after step {step + 1:,}: {_memory_summary()}")
 
         if master and (step + 1) % args.log_every == 0:
             dt = time.perf_counter() - t0

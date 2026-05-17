@@ -70,9 +70,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mix",
         default="kaggle_chunk",
-        choices=["pilot", "kaggle_chunk"],
+        choices=["pilot", "kaggle_chunk", "kaggle_fineweb_only", "kaggle_no_math"],
         help="Dataset mix preset forwarded to metaterid_pilot_2b.py.",
     )
+    parser.add_argument("--log-memory", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -118,6 +119,8 @@ def main() -> None:
         command.append("--resume")
     if args.resume_optimizer:
         command.append("--resume-optimizer")
+    if args.log_memory:
+        command.append("--log-memory")
 
     print(f"Current tokens: {tokens_seen:,}")
     print(f"Target tokens after this chunk: {target_tokens:,}")
