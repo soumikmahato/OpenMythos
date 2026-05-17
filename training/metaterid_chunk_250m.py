@@ -45,11 +45,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-tokens", type=int, default=250_000_000)
     parser.add_argument("--max-tokens", type=int, default=2_000_000_000)
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--micro-batch", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--micro-batch", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--nproc-per-node", type=int, default=2)
+    parser.add_argument(
+        "--max-sample-chars",
+        type=int,
+        default=65_536,
+        help="Maximum characters from one source document to tokenize at once. Use 0 to disable.",
+    )
     parser.add_argument(
         "--current-tokens",
         type=int,
@@ -103,6 +109,8 @@ def main() -> None:
         str(args.num_workers),
         "--log-every",
         str(args.log_every),
+        "--max-sample-chars",
+        str(args.max_sample_chars),
         "--mix",
         args.mix,
     ]

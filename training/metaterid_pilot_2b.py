@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adam", "muon"])
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--max-sample-chars",
+        type=int,
+        default=131_072,
+        help="Maximum characters from one source document to tokenize at once. Use 0 to disable.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--resume-optimizer",
@@ -201,6 +207,7 @@ def main() -> None:
         rank=rank,
         world_size=world_size,
         seed=args.seed,
+        max_sample_chars=args.max_sample_chars,
     )
     loader = DataLoader(
         dataset,

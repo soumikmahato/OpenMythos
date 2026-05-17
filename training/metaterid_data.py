@@ -335,6 +335,7 @@ class MixedTokenDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         seed: int = 1337,
+        max_sample_chars: int = 131_072,
     ):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -342,6 +343,13 @@ class MixedTokenDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.max_sample_chars = max_sample_chars
+
+    def _bounded_text(self, text: str, rng: random.Random) -> str:
+        if self.max_sample_chars <= 0 or len(text) <= self.max_sample_chars:
+            return text
+        start = rng.randint(0, len(text) - self.max_sample_chars)
+        return text[start : start + self.max_sample_chars]
 
     def __iter__(self):
         rng = random.Random(self.seed + self.rank)
@@ -362,6 +370,7 @@ class MixedTokenDataset(IterableDataset):
                 source_iters[name] = itertools.cycle(())
                 continue
 
+            text = self._bounded_text(text, rng)
             buf.extend(self.tokenizer.encode(text))
             while len(buf) >= self.seq_len + 1:
                 chunk = buf[: self.seq_len + 1]
