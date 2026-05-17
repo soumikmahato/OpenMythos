@@ -78,6 +78,9 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def _latest_checkpoint(path: Path) -> Path | None:
+    model_only = path / "model_only.pt"
+    if model_only.exists():
+        return model_only
     ckpts = sorted(path.glob("tokens_*.pt"))
     final = path / "final.pt"
     if final.exists():
