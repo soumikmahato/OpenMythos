@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--nproc-per-node", type=int, default=2)
+    parser.add_argument(
+        "--mix",
+        default="kaggle_chunk",
+        choices=["pilot", "kaggle_chunk"],
+        help="Dataset mix preset forwarded to metaterid_pilot_2b.py.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -73,6 +79,8 @@ def main() -> None:
         str(args.num_workers),
         "--log-every",
         str(args.log_every),
+        "--mix",
+        args.mix,
     ]
     if tokens_seen > 0:
         command.append("--resume")

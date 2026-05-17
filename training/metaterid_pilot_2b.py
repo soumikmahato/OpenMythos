@@ -25,7 +25,11 @@ from torch.utils.data import DataLoader
 
 from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
-from training.metaterid_data import METATERID_T4_PILOT_MIX, MixedTokenDataset
+from training.metaterid_data import (
+    METATERID_T4_KAGGLE_CHUNK_MIX,
+    METATERID_T4_PILOT_MIX,
+    MixedTokenDataset,
+)
 from training.metaterid_optim import build_optimizer
 
 TOKEN_MILESTONES = (10_000_000, 100_000_000, 500_000_000, 1_000_000_000, 2_000_000_000)
@@ -93,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--mix",
+        default="pilot",
+        choices=["pilot", "kaggle_chunk"],
+        help="Dataset mix preset. Use kaggle_chunk for memory-safe Kaggle continuation.",
+    )
     return parser.parse_args()
 
 
@@ -164,10 +174,15 @@ def main() -> None:
             if master:
                 logger.info("Resumed optimizer state")
 
+    sources = (
+        METATERID_T4_KAGGLE_CHUNK_MIX
+        if args.mix == "kaggle_chunk"
+        else METATERID_T4_PILOT_MIX
+    )
     dataset = MixedTokenDataset(
         tokenizer,
         args.seq_len,
-        METATERID_T4_PILOT_MIX,
+        sources,
         rank=rank,
         world_size=world_size,
         seed=args.seed,

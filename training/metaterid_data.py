@@ -133,6 +133,39 @@ METATERID_T4_LOCAL_PRIVATE_MIX = [
 ]
 
 
+METATERID_T4_KAGGLE_CHUNK_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.70,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="codeparrot_clean_code",
+        weight=0.10,
+        dataset="codeparrot/codeparrot-clean",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.12,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="instruction_openhermes_25",
+        weight=0.08,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+]
+
+
 def normalize_weights(sources: list[DataSource]) -> list[DataSource]:
     total = sum(source.weight for source in sources)
     if total <= 0:
