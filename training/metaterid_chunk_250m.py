@@ -70,7 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mix",
         default="kaggle_chunk",
-        choices=["pilot", "kaggle_chunk", "kaggle_fineweb_only", "kaggle_no_math"],
+        choices=[
+            "pilot",
+            "kaggle_chunk",
+            "kaggle_fineweb_only",
+            "kaggle_no_math",
+            "kaggle_fineweb_math",
+            "kaggle_fineweb_code_instruct",
+        ],
         help="Dataset mix preset forwarded to metaterid_pilot_2b.py.",
     )
     parser.add_argument("--log-memory", action="store_true")

@@ -29,6 +29,8 @@ from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 from training.metaterid_data import (
     METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX,
+    METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX,
+    METATERID_T4_KAGGLE_FINEWEB_MATH_MIX,
     METATERID_T4_KAGGLE_CHUNK_MIX,
     METATERID_T4_KAGGLE_NO_MATH_MIX,
     METATERID_T4_PILOT_MIX,
@@ -149,7 +151,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mix",
         default="pilot",
-        choices=["pilot", "kaggle_chunk", "kaggle_fineweb_only", "kaggle_no_math"],
+        choices=[
+            "pilot",
+            "kaggle_chunk",
+            "kaggle_fineweb_only",
+            "kaggle_no_math",
+            "kaggle_fineweb_math",
+            "kaggle_fineweb_code_instruct",
+        ],
         help="Dataset mix preset. Use kaggle_chunk for memory-safe Kaggle continuation.",
     )
     parser.add_argument("--log-memory", action="store_true")
@@ -238,6 +247,10 @@ def main() -> None:
         sources = METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX
     elif args.mix == "kaggle_no_math":
         sources = METATERID_T4_KAGGLE_NO_MATH_MIX
+    elif args.mix == "kaggle_fineweb_math":
+        sources = METATERID_T4_KAGGLE_FINEWEB_MATH_MIX
+    elif args.mix == "kaggle_fineweb_code_instruct":
+        sources = METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX
     else:
         sources = METATERID_T4_PILOT_MIX
     dataset = MixedTokenDataset(
