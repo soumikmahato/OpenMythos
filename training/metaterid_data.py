@@ -247,6 +247,120 @@ METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX = [
 ]
 
 
+METATERID_T4_KAGGLE_FACTUAL_REFERENCE_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.75,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="reference_wiki",
+        weight=0.25,
+        dataset="wikimedia/wikipedia",
+        config="20231101.en",
+        split="train",
+        text_field="text",
+    ),
+]
+
+
+METATERID_T4_KAGGLE_INSTRUCT_TOOL_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.70,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="instruction_openhermes_25",
+        weight=0.15,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+    DataSource(
+        name="instruction_tulu3_personas_if",
+        weight=0.10,
+        dataset="allenai/tulu-3-sft-personas-instruction-following",
+        split="train",
+        text_field="messages",
+        formatter="messages",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.05,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+]
+
+
+METATERID_T4_KAGGLE_MULTILINGUAL_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.80,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="multilingual_fineweb2_hq",
+        weight=0.20,
+        dataset="epfml/FineWeb2-HQ",
+        config="deu_Latn",
+        split="train",
+        text_field="text",
+        formatter="text",
+    ),
+]
+
+
+METATERID_T4_KAGGLE_CONSOLIDATE_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.70,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.10,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="codeparrot_clean_code",
+        weight=0.08,
+        dataset="codeparrot/codeparrot-clean",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="reference_wiki",
+        weight=0.07,
+        dataset="wikimedia/wikipedia",
+        config="20231101.en",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="instruction_openhermes_25",
+        weight=0.05,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+]
+
+
 def normalize_weights(sources: list[DataSource]) -> list[DataSource]:
     total = sum(source.weight for source in sources)
     if total <= 0:

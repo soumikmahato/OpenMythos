@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
             "kaggle_no_math",
             "kaggle_fineweb_math",
             "kaggle_fineweb_code_instruct",
+            "kaggle_factual_reference",
+            "kaggle_instruct_tool",
+            "kaggle_multilingual",
+            "kaggle_consolidate",
         ],
         help="Dataset mix preset forwarded to metaterid_pilot_2b.py.",
     )

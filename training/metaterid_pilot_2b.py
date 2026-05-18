@@ -28,10 +28,14 @@ from torch.utils.data import DataLoader
 from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 from training.metaterid_data import (
+    METATERID_T4_KAGGLE_CONSOLIDATE_MIX,
+    METATERID_T4_KAGGLE_FACTUAL_REFERENCE_MIX,
     METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX,
     METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX,
     METATERID_T4_KAGGLE_FINEWEB_MATH_MIX,
+    METATERID_T4_KAGGLE_INSTRUCT_TOOL_MIX,
     METATERID_T4_KAGGLE_CHUNK_MIX,
+    METATERID_T4_KAGGLE_MULTILINGUAL_MIX,
     METATERID_T4_KAGGLE_NO_MATH_MIX,
     METATERID_T4_PILOT_MIX,
     MixedTokenDataset,
@@ -158,6 +162,10 @@ def parse_args() -> argparse.Namespace:
             "kaggle_no_math",
             "kaggle_fineweb_math",
             "kaggle_fineweb_code_instruct",
+            "kaggle_factual_reference",
+            "kaggle_instruct_tool",
+            "kaggle_multilingual",
+            "kaggle_consolidate",
         ],
         help="Dataset mix preset. Use kaggle_chunk for memory-safe Kaggle continuation.",
     )
@@ -251,6 +259,14 @@ def main() -> None:
         sources = METATERID_T4_KAGGLE_FINEWEB_MATH_MIX
     elif args.mix == "kaggle_fineweb_code_instruct":
         sources = METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX
+    elif args.mix == "kaggle_factual_reference":
+        sources = METATERID_T4_KAGGLE_FACTUAL_REFERENCE_MIX
+    elif args.mix == "kaggle_instruct_tool":
+        sources = METATERID_T4_KAGGLE_INSTRUCT_TOOL_MIX
+    elif args.mix == "kaggle_multilingual":
+        sources = METATERID_T4_KAGGLE_MULTILINGUAL_MIX
+    elif args.mix == "kaggle_consolidate":
+        sources = METATERID_T4_KAGGLE_CONSOLIDATE_MIX
     else:
         sources = METATERID_T4_PILOT_MIX
     dataset = MixedTokenDataset(
