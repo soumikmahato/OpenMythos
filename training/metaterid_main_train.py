@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import math
 import os
 import random
@@ -23,7 +24,6 @@ from typing import Iterable
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from loguru import logger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
@@ -31,6 +31,13 @@ from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_1b, metaterid_
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 from training.metaterid_data import MIX_PRESETS, MixedTokenDataset, get_mix_sources
 from training.metaterid_optim import build_optimizer
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
+)
+logger = logging.getLogger("metaterid_main_train")
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -447,7 +454,7 @@ def main() -> None:
                     tokens_seen=tokens_seen,
                     save_optimizer=args.save_optimizer,
                 )
-                logger.success(f"Saved milestone checkpoint {path}")
+                logger.info(f"Saved milestone checkpoint {path}")
             if ddp:
                 dist.barrier()
             milestone_index += 1
@@ -482,7 +489,7 @@ def main() -> None:
             tokens_seen=tokens_seen,
             save_optimizer=False,
         )
-        logger.success(f"Training complete. Final checkpoint: {ckpt_dir / 'final.pt'}")
+        logger.info(f"Training complete. Final checkpoint: {ckpt_dir / 'final.pt'}")
 
     if ddp:
         dist.barrier()
