@@ -1,5 +1,6 @@
 torch>=2.11.0
 tokenizers>=0.19.0
+transformers>=4.42.0
 datasets>=3.6.0
 loguru>=0.7.3
 open-mythos

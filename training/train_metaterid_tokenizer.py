@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 from pathlib import Path
 
-from open_mythos.metaterid_tokenizer import (
-    METATERID_SPECIAL_TOKENS,
-    METATERID_VOCAB_SIZE,
-    train_metaterid_tokenizer,
-)
+ROOT = Path(__file__).resolve().parents[1]
+TOKENIZER_MODULE_PATH = ROOT / "open_mythos" / "metaterid_tokenizer.py"
+spec = importlib.util.spec_from_file_location("_metaterid_tokenizer", TOKENIZER_MODULE_PATH)
+if spec is None or spec.loader is None:
+    raise ImportError(f"Could not load {TOKENIZER_MODULE_PATH}")
+_tokenizer_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_tokenizer_module)
+
+METATERID_SPECIAL_TOKENS = _tokenizer_module.METATERID_SPECIAL_TOKENS
+METATERID_VOCAB_SIZE = _tokenizer_module.METATERID_VOCAB_SIZE
+train_metaterid_tokenizer = _tokenizer_module.train_metaterid_tokenizer
 
 
 def expand_inputs(patterns: list[str]) -> list[Path]:

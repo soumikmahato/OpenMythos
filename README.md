@@ -170,11 +170,25 @@ Key design choices:
 
 MetaTerid uses a custom byte-level BPE tokenizer named
 `metaterid-tokenizer-v1` with a target vocabulary size of `65,536`, including
-reserved chat, thinking, tool, and fill-in-the-middle tokens. Train it with:
+reserved chat, thinking, tool, and fill-in-the-middle tokens. First build a
+diverse tokenizer corpus with English, code, math/LaTeX, chat, and tool traces:
 
 ```bash
-python training/train_metaterid_tokenizer.py data/**/*.txt \
+python training/prepare_metaterid_tokenizer_corpus.py \
+  --output-dir data/tokenizer_corpus \
+  --total-docs 500000 \
+  --shards 32
+```
+
+Then train and inspect the tokenizer:
+
+```bash
+python training/train_metaterid_tokenizer.py "data/tokenizer_corpus/*.txt" \
   --output-dir tokenizers/metaterid-tokenizer-v1
+
+python training/inspect_metaterid_tokenizer.py \
+  --tokenizer tokenizers/metaterid-tokenizer-v1 \
+  --output tokenizer_inspection.json
 ```
 
 See [`docs/metaterid_tokenizer.md`](docs/metaterid_tokenizer.md) for the
@@ -189,6 +203,7 @@ reserved token list and training notes.
 | [`docs/open_mythos.md`](docs/open_mythos.md) | Full API reference for the `OpenMythos` class — constructor, `forward`, `generate`, all sub-modules, configuration reference, and usage examples |
 | [`docs/datasets.md`](docs/datasets.md) | Recommended training datasets with token budget guidance per model size |
 | [`docs/metaterid_tokenizer.md`](docs/metaterid_tokenizer.md) | MetaTerid tokenizer target, reserved tokens, and local training command |
+| [`TOKENIZER_TRAINING_GUIDE.md`](TOKENIZER_TRAINING_GUIDE.md) | Step-by-step tokenizer corpus, training, and inspection workflow |
 
 ---
 

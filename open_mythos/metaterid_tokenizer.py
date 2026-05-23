@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from transformers import PreTrainedTokenizerFast
+try:
+    from transformers import PreTrainedTokenizerFast
+except ImportError as exc:
+    raise ImportError(
+        "MetaTerid tokenizer loading/training requires the `transformers` package. "
+        "Install tokenizer dependencies with `pip install tokenizers transformers datasets`."
+    ) from exc
 
 METATERID_TOKENIZER_NAME = "metaterid-tokenizer-v1"
 METATERID_VOCAB_SIZE = 65_536

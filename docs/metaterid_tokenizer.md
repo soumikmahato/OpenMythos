@@ -40,13 +40,30 @@ The tokenizer reserves chat, thinking, tool, and fill-in-the-middle tokens:
 <|eot|>
 ```
 
+## Corpus
+
+Before training the BPE model, build a diverse corpus that explicitly includes
+English prose, code, math/LaTeX, chat-format text, tool JSON, and FIM examples:
+
+```bash
+python training/prepare_metaterid_tokenizer_corpus.py \
+  --output-dir data/tokenizer_corpus \
+  --total-docs 500000 \
+  --shards 32 \
+  --max-chars 32768
+```
+
+The default corpus mix uses FineWeb-Edu, OpenWebMath, CodeParrot clean code,
+OpenHermes, Hermes function-calling examples, and synthetic MetaTerid format
+examples so every reserved token appears many times.
+
 ## Training
 
 Train from local corpus text files, directories of `.txt` files, or glob
 patterns:
 
 ```bash
-python training/train_metaterid_tokenizer.py data/**/*.txt \
+python training/train_metaterid_tokenizer.py "data/tokenizer_corpus/*.txt" \
   --output-dir tokenizers/metaterid-tokenizer-v1 \
   --vocab-size 65536 \
   --min-frequency 2
@@ -69,3 +86,14 @@ text = tok.decode(ids)
 - Before full pretraining, evaluate fertility on the actual training mixture:
   English prose, code, math, tool traces, reasoning traces, and selected
   multilingual samples.
+
+Run the built-in inspection script after training:
+
+```bash
+python training/inspect_metaterid_tokenizer.py \
+  --tokenizer tokenizers/metaterid-tokenizer-v1 \
+  --output tokenizer_inspection.json
+```
+
+See [`../TOKENIZER_TRAINING_GUIDE.md`](../TOKENIZER_TRAINING_GUIDE.md) for the
+step-by-step workflow.

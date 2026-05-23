@@ -2,13 +2,27 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-from collections import Counter
 from pathlib import Path
 
-from transformers import PreTrainedTokenizerFast
+try:
+    from transformers import PreTrainedTokenizerFast
+except ImportError as exc:
+    raise ImportError(
+        "Tokenizer inspection requires `transformers`. "
+        "Install tokenizer dependencies with `pip install tokenizers transformers datasets`."
+    ) from exc
 
-from open_mythos.metaterid_tokenizer import METATERID_SPECIAL_TOKENS
+ROOT = Path(__file__).resolve().parents[1]
+TOKENIZER_MODULE_PATH = ROOT / "open_mythos" / "metaterid_tokenizer.py"
+spec = importlib.util.spec_from_file_location("_metaterid_tokenizer", TOKENIZER_MODULE_PATH)
+if spec is None or spec.loader is None:
+    raise ImportError(f"Could not load {TOKENIZER_MODULE_PATH}")
+_tokenizer_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_tokenizer_module)
+
+METATERID_SPECIAL_TOKENS = _tokenizer_module.METATERID_SPECIAL_TOKENS
 
 
 PROBE_TEXTS = {
@@ -46,6 +60,11 @@ PROBE_TEXTS = {
         "∑_{i=1}^{n} i = n(n+1)/2",
         "3.14159",
     ],
+    "latex_math": [
+        r"Let $a,b \in \mathbb{R}$. Then $(a+b)^2 = a^2 + 2ab + b^2$.",
+        r"\begin{align} y &= mx + b \\ \Delta &= b^2 - 4ac \end{align}",
+        r"The loss is \(\mathcal{L} = -\sum_i y_i \log p_i\).",
+    ],
     "code": [
         "print('hello world')",
         "def add(a, b):\n    return a + b",
@@ -56,6 +75,13 @@ PROBE_TEXTS = {
     "tool": [
         "<|tool_call|>{\"name\":\"web_search\",\"arguments\":{\"query\":\"weather\"}}<|eot|>",
         "<|tool_result|>{\"results\":[{\"title\":\"Example\",\"url\":\"https://example.com\"}]}<|eot|>",
+    ],
+    "chat": [
+        "<|system|>You are MetaTerid.<|user|>Explain briefly.<|assistant|><|answer|>Done.<|eot|>",
+        "<|user|>Think briefly, then answer.<|assistant|><|think|>Short reasoning.<|end_think|><|answer|>Final.<|eot|>",
+    ],
+    "fim": [
+        "<|fim_prefix|>def add(a, b):\n    <|fim_suffix|>\nprint(add(2, 3))<|fim_middle|>return a + b",
     ],
 }
 
