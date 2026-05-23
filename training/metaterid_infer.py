@@ -27,12 +27,12 @@ def main() -> None:
     args = parse_args()
     tokenizer = MetaTeridTokenizer(args.tokenizer)
 
-    cfg = metaterid_t4_pilot()
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    cfg = checkpoint.get("cfg") or metaterid_t4_pilot()
     cfg.vocab_size = tokenizer.vocab_size
     cfg.max_seq_len = args.seq_len
 
     model = MetaTeridForCausalLM(cfg).to(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 

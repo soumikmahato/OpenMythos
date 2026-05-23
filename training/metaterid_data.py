@@ -361,6 +361,190 @@ METATERID_T4_KAGGLE_CONSOLIDATE_MIX = [
 ]
 
 
+METATERID_MAIN_BASE_V0_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.62,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.10,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="codeparrot_clean_code",
+        weight=0.10,
+        dataset="codeparrot/codeparrot-clean",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="instruction_openhermes_25",
+        weight=0.06,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+    DataSource(
+        name="reference_wiki_low",
+        weight=0.04,
+        dataset="wikimedia/wikipedia",
+        config="20231101.en",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="instruction_tulu3_personas_if",
+        weight=0.03,
+        dataset="allenai/tulu-3-sft-personas-instruction-following",
+        split="train",
+        text_field="messages",
+        formatter="messages",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.03,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+    DataSource(
+        name="multilingual_fineweb2_hq",
+        weight=0.02,
+        dataset="epfml/FineWeb2-HQ",
+        config="deu_Latn",
+        split="train",
+        text_field="text",
+        formatter="text",
+    ),
+]
+
+
+METATERID_MAIN_STABLE_WEB_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.90,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.05,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="codeparrot_clean_code",
+        weight=0.05,
+        dataset="codeparrot/codeparrot-clean",
+        split="train",
+        text_field="content",
+    ),
+]
+
+
+METATERID_MAIN_REASONING_BOOTSTRAP_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.60,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.20,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="codeparrot_clean_code",
+        weight=0.10,
+        dataset="codeparrot/codeparrot-clean",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="instruction_openhermes_25",
+        weight=0.10,
+        dataset="teknium/OpenHermes-2.5",
+        split="train",
+        text_field="conversations",
+        formatter="messages",
+    ),
+]
+
+
+METATERID_MAIN_LOCAL_CURATED_MIX = [
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.70,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="local_arithmetic",
+        weight=0.10,
+        local_jsonl="data/arithmetic.jsonl",
+        formatter="auto",
+    ),
+    DataSource(
+        name="local_factual_qa",
+        weight=0.08,
+        local_jsonl="data/factual_qa.jsonl",
+        formatter="auto",
+    ),
+    DataSource(
+        name="local_instruction",
+        weight=0.07,
+        local_jsonl="data/instruction.jsonl",
+        formatter="auto",
+    ),
+    DataSource(
+        name="local_tool_chat",
+        weight=0.05,
+        local_jsonl="data/tool_chat.jsonl",
+        formatter="auto",
+    ),
+]
+
+
+MIX_PRESETS = {
+    "pilot": METATERID_T4_PILOT_MIX,
+    "kaggle_chunk": METATERID_T4_KAGGLE_CHUNK_MIX,
+    "kaggle_fineweb_only": METATERID_T4_KAGGLE_FINEWEB_ONLY_MIX,
+    "kaggle_no_math": METATERID_T4_KAGGLE_NO_MATH_MIX,
+    "kaggle_fineweb_math": METATERID_T4_KAGGLE_FINEWEB_MATH_MIX,
+    "kaggle_fineweb_code_instruct": METATERID_T4_KAGGLE_FINEWEB_CODE_INSTRUCT_MIX,
+    "kaggle_factual_reference": METATERID_T4_KAGGLE_FACTUAL_REFERENCE_MIX,
+    "kaggle_instruct_tool": METATERID_T4_KAGGLE_INSTRUCT_TOOL_MIX,
+    "kaggle_multilingual": METATERID_T4_KAGGLE_MULTILINGUAL_MIX,
+    "kaggle_consolidate": METATERID_T4_KAGGLE_CONSOLIDATE_MIX,
+    "main_base_v0": METATERID_MAIN_BASE_V0_MIX,
+    "main_stable_web": METATERID_MAIN_STABLE_WEB_MIX,
+    "main_reasoning_bootstrap": METATERID_MAIN_REASONING_BOOTSTRAP_MIX,
+    "main_local_curated": METATERID_MAIN_LOCAL_CURATED_MIX,
+}
+
+
+def get_mix_sources(name: str) -> list[DataSource]:
+    try:
+        return MIX_PRESETS[name]
+    except KeyError as exc:
+        options = ", ".join(sorted(MIX_PRESETS))
+        raise ValueError(f"Unknown mix preset '{name}'. Available: {options}") from exc
+
+
 def normalize_weights(sources: list[DataSource]) -> list[DataSource]:
     total = sum(source.weight for source in sources)
     if total <= 0:
