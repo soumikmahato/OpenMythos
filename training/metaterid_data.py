@@ -530,6 +530,8 @@ MIX_PRESETS = {
     "kaggle_instruct_tool": METATERID_T4_KAGGLE_INSTRUCT_TOOL_MIX,
     "kaggle_multilingual": METATERID_T4_KAGGLE_MULTILINGUAL_MIX,
     "kaggle_consolidate": METATERID_T4_KAGGLE_CONSOLIDATE_MIX,
+    "final": METATERID_MAIN_BASE_V0_MIX,
+    "current_mixed": METATERID_MAIN_BASE_V0_MIX,
     "main_base_v0": METATERID_MAIN_BASE_V0_MIX,
     "main_stable_web": METATERID_MAIN_STABLE_WEB_MIX,
     "main_reasoning_bootstrap": METATERID_MAIN_REASONING_BOOTSTRAP_MIX,

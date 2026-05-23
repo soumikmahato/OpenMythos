@@ -70,7 +70,11 @@ def _parse_csv_ints(value: str) -> list[int]:
     return [int(part.replace("_", "")) for part in value.split(",") if part.strip()]
 
 
-def _latest_checkpoint(path: Path) -> Path | None:
+def _latest_checkpoint(path: Path, *, prefer_final: bool = False) -> Path | None:
+    if prefer_final:
+        final = path / "final.pt"
+        if final.exists():
+            return final
     model_only = path / "model_only.pt"
     if model_only.exists():
         return model_only
@@ -155,9 +159,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--ckpt-dir", default="checkpoints/metaterid_main")
     parser.add_argument("--variant", default="metaterid_1b", choices=["metaterid_1b", "t4_pilot"])
-    parser.add_argument("--mix", default="main_base_v0", choices=sorted(MIX_PRESETS))
+    parser.add_argument("--mix", default="final", choices=sorted(MIX_PRESETS))
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--target-tokens", type=int, default=100_000_000_000)
+    parser.add_argument(
+        "--additional-tokens",
+        type=int,
+        default=0,
+        help="Train this many more tokens from the resumed checkpoint. Overrides --target-tokens after resume.",
+    )
     parser.add_argument(
         "--checkpoint-tokens",
         default="1_000_000_000,5_000_000_000,10_000_000_000,30_000_000_000,50_000_000_000,100_000_000_000",
@@ -186,6 +196,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-path",
+        default="",
+        help="Explicit checkpoint path to resume from. Overrides automatic checkpoint selection.",
+    )
+    parser.add_argument(
+        "--resume-from-final",
+        action="store_true",
+        help="Prefer final.pt over model_only.pt when resuming, useful for optimizer-state resume.",
+    )
     parser.add_argument("--resume-optimizer", action="store_true")
     parser.add_argument("--save-optimizer", action="store_true")
     parser.add_argument("--find-unused-parameters", action="store_true", default=True)
@@ -229,11 +249,17 @@ def main() -> None:
     ckpt_dir = Path(args.ckpt_dir)
     start_step = 0
     tokens_seen = 0
+    resume_path: Path | None = None
 
     base_model = MetaTeridForCausalLM(cfg).to(device)
     if args.resume:
-        latest = _latest_checkpoint(ckpt_dir)
+        latest = (
+            Path(args.resume_path)
+            if args.resume_path
+            else _latest_checkpoint(ckpt_dir, prefer_final=args.resume_from_final)
+        )
         if latest is not None:
+            resume_path = latest
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             base_model.load_state_dict(ckpt["model"])
             start_step = int(ckpt.get("step", 0))
@@ -242,6 +268,15 @@ def main() -> None:
             gc.collect()
             if master:
                 logger.info(f"Resumed model from {latest} at {tokens_seen:,} tokens")
+
+    target_tokens = args.target_tokens
+    if args.additional_tokens > 0:
+        target_tokens = tokens_seen + args.additional_tokens
+        if master:
+            logger.info(
+                f"Using additional token target: {tokens_seen:,} + "
+                f"{args.additional_tokens:,} = {target_tokens:,}"
+            )
 
     model = base_model
     if args.compile:
@@ -255,7 +290,7 @@ def main() -> None:
             find_unused_parameters=args.find_unused_parameters,
         )
 
-    switch_tokens = int(args.target_tokens * args.muon_switch_ratio)
+    switch_tokens = int(target_tokens * args.muon_switch_ratio)
     optimizer_name = (
         args.optimizer_after_switch
         if args.muon_switch_ratio < 1.0 and tokens_seen >= switch_tokens
@@ -270,7 +305,13 @@ def main() -> None:
     switched = optimizer_name == args.optimizer_after_switch
 
     if args.resume and args.resume_optimizer:
-        latest = _latest_checkpoint(ckpt_dir)
+        latest = (
+            Path(args.resume_path)
+            if args.resume_path
+            else resume_path
+            if resume_path is not None
+            else _latest_checkpoint(ckpt_dir, prefer_final=True)
+        )
         if latest is not None:
             ckpt = torch.load(latest, map_location="cpu", weights_only=False)
             if "optimizer" in ckpt:
@@ -314,7 +355,7 @@ def main() -> None:
         logger.info(
             f"variant={args.variant} mix={args.mix} ddp={ddp} world_size={world_size} "
             f"seq_len={args.seq_len} micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
-            f"global_batch_tokens={global_batch_tokens:,} target_tokens={args.target_tokens:,} "
+            f"global_batch_tokens={global_batch_tokens:,} target_tokens={target_tokens:,} "
             f"optimizer={optimizer_name} precision={precision_dtype}"
         )
         if args.log_memory:
@@ -326,7 +367,7 @@ def main() -> None:
     t0 = time.perf_counter()
     last_log_step = step
 
-    while tokens_seen < args.target_tokens:
+    while tokens_seen < target_tokens:
         if (
             not switched
             and args.muon_switch_ratio < 1.0
@@ -347,7 +388,7 @@ def main() -> None:
         lr = _lr_by_tokens(
             tokens_seen,
             warmup_tokens=args.warmup_tokens,
-            target_tokens=args.target_tokens,
+            target_tokens=target_tokens,
             max_lr=args.lr,
             min_lr=args.min_lr,
         )
@@ -383,7 +424,7 @@ def main() -> None:
             steps_delta = max(1, step - last_log_step)
             tok_per_sec = global_batch_tokens * steps_delta / max(dt, 1e-6)
             logger.info(
-                f"step={step:,} tokens={tokens_seen:,}/{args.target_tokens:,} "
+                f"step={step:,} tokens={tokens_seen:,}/{target_tokens:,} "
                 f"loss={loss_accum:.4f} grad_norm={float(grad_norm):.2f} "
                 f"lr={lr:.2e} optimizer={'post_switch' if switched else 'pre_switch'} "
                 f"tok/s={tok_per_sec:,.0f}"

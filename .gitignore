@@ -428,3 +428,14 @@ flycheck_*.el
 # network security
 /network-security.data
 
+AGENTS.md
+.gitignore
+.gitignore
+PLAN.md
+.gitignore
+KAGGLE_STEPS_BY_STEP.md
+KAGGLE_SUBSEQUENT_TRAINING_GUIDE.md
+training_log.md
+EVAL_AND_INFERENCE_GUIDE.md
+.gitignore
+MAIN_TRAINING_GUIDE.md
