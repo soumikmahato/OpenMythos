@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -276,6 +278,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-chars", type=int, default=32_768)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--report-every", type=int, default=10_000)
+    parser.add_argument(
+        "--hard-exit",
+        action="store_true",
+        help=(
+            "Flush files and exit with os._exit(0) after success. Useful in some "
+            "notebook runtimes where datasets/pyarrow finalizers abort at shutdown."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -294,6 +304,7 @@ def main() -> None:
         for idx in range(args.shards)
     ]
     counts = {name: 0 for name in source_names}
+    exhausted_sources: list[str] = []
     failed_sources: dict[str, str] = {}
 
     try:
@@ -302,6 +313,14 @@ def main() -> None:
             iterator = source_iters[name]
             try:
                 text = next(iterator)
+            except StopIteration:
+                print(f"[tokenizer_corpus] source {name} exhausted", flush=True)
+                source_names.remove(name)
+                exhausted_sources.append(name)
+                if not source_names:
+                    break
+                weights = _source_weights(source_names)
+                continue
             except Exception as exc:
                 print(f"[tokenizer_corpus] source {name} failed with {type(exc).__name__}: {exc}", flush=True)
                 source_names.remove(name)
@@ -328,6 +347,7 @@ def main() -> None:
         "total_docs_requested": args.total_docs,
         "requested_sources": requested_sources,
         "active_sources": source_names,
+        "exhausted_sources": exhausted_sources,
         "failed_sources": failed_sources,
         "counts": counts,
         "max_chars": args.max_chars,
@@ -335,6 +355,10 @@ def main() -> None:
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if args.hard_exit:
+        os._exit(0)
 
 
 if __name__ == "__main__":
