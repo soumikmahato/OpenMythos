@@ -190,6 +190,44 @@ def _language_model_loss(
     return total_loss / total_tokens
 
 
+def _backward_language_model_loss(
+    *,
+    model,
+    lm_head: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    vocab_size: int,
+    n_loops: int,
+    loss_chunk_tokens: int,
+    loss_scale: float,
+) -> float:
+    if loss_chunk_tokens <= 0:
+        logits = model(input_ids, n_loops=n_loops)
+        loss = F.cross_entropy(logits.view(-1, vocab_size), labels.view(-1))
+        scaled_loss = loss * loss_scale
+        scaled_loss.backward()
+        return float(scaled_loss.detach())
+
+    hidden = model(input_ids, n_loops=n_loops, return_hidden=True)
+    hidden = hidden.reshape(-1, hidden.shape[-1])
+    labels = labels.reshape(-1)
+    total_tokens = labels.numel()
+    loss_accum = 0.0
+
+    for start in range(0, total_tokens, loss_chunk_tokens):
+        end = min(start + loss_chunk_tokens, total_tokens)
+        logits = lm_head(hidden[start:end])
+        chunk_loss_sum = F.cross_entropy(
+            logits, labels[start:end], reduction="sum"
+        )
+        scaled_chunk_loss = chunk_loss_sum * (loss_scale / total_tokens)
+        retain_graph = end < total_tokens
+        scaled_chunk_loss.backward(retain_graph=retain_graph)
+        loss_accum += float(scaled_chunk_loss.detach())
+
+    return loss_accum
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True)
@@ -471,7 +509,7 @@ def main() -> None:
                 else nullcontext()
             )
             with sync_ctx, amp_ctx:
-                loss = _language_model_loss(
+                loss_value = _backward_language_model_loss(
                     model=model,
                     lm_head=base_model.head,
                     input_ids=x,
@@ -479,10 +517,9 @@ def main() -> None:
                     vocab_size=cfg.vocab_size,
                     n_loops=n_loops,
                     loss_chunk_tokens=args.loss_chunk_tokens,
+                    loss_scale=1.0 / args.grad_accum,
                 )
-                loss = loss / args.grad_accum
-            loss.backward()
-            loss_accum += float(loss.detach())
+            loss_accum += loss_value
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
