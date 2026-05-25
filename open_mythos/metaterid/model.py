@@ -48,6 +48,7 @@ class MetaTeridForCausalLM(OpenMythos):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         T = input_ids.shape[1]
         device = input_ids.device
@@ -75,4 +76,7 @@ class MetaTeridForCausalLM(OpenMythos):
             x = self._apply_attn_res(x, sources)
             sources.append(x)
 
-        return self.head(self.norm(x))
+        x = self.norm(x)
+        if return_hidden:
+            return x
+        return self.head(x)

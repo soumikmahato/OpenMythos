@@ -161,6 +161,35 @@ def _save_checkpoint(
     )
 
 
+def _language_model_loss(
+    *,
+    model,
+    lm_head: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    vocab_size: int,
+    n_loops: int,
+    loss_chunk_tokens: int,
+) -> torch.Tensor:
+    if loss_chunk_tokens <= 0:
+        logits = model(input_ids, n_loops=n_loops)
+        return F.cross_entropy(logits.view(-1, vocab_size), labels.view(-1))
+
+    hidden = model(input_ids, n_loops=n_loops, return_hidden=True)
+    hidden = hidden.reshape(-1, hidden.shape[-1])
+    labels = labels.reshape(-1)
+    total_loss = hidden.new_zeros(())
+    total_tokens = labels.numel()
+
+    for start in range(0, total_tokens, loss_chunk_tokens):
+        end = min(start + loss_chunk_tokens, total_tokens)
+        logits = lm_head(hidden[start:end])
+        total_loss = total_loss + F.cross_entropy(
+            logits, labels[start:end], reduction="sum"
+        )
+    return total_loss / total_tokens
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True)
@@ -184,6 +213,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-sample-chars", type=int, default=131_072)
+    parser.add_argument(
+        "--loss-chunk-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If >0, compute the tied LM head and cross-entropy in chunks of this "
+            "many flattened tokens. Reduces peak memory for large vocabularies."
+        ),
+    )
+    parser.add_argument(
+        "--train-min-loops",
+        type=int,
+        default=0,
+        help="Override cfg.train_min_loops. Use for speed/memory smoke tests.",
+    )
+    parser.add_argument(
+        "--train-max-loops",
+        type=int,
+        default=0,
+        help="Override cfg.train_max_loops. Use for speed/memory smoke tests.",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min-lr", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -252,6 +302,12 @@ def main() -> None:
     cfg = _load_variant(args.variant)
     cfg.vocab_size = tokenizer.vocab_size
     cfg.max_seq_len = args.seq_len
+    if args.train_min_loops > 0:
+        cfg.train_min_loops = args.train_min_loops
+    if args.train_max_loops > 0:
+        cfg.train_max_loops = args.train_max_loops
+    if cfg.train_min_loops > cfg.train_max_loops:
+        raise ValueError("--train-min-loops cannot exceed --train-max-loops")
 
     ckpt_dir = Path(args.ckpt_dir)
     start_step = 0
@@ -415,8 +471,15 @@ def main() -> None:
                 else nullcontext()
             )
             with sync_ctx, amp_ctx:
-                logits = model(x, n_loops=n_loops)
-                loss = F.cross_entropy(logits.view(-1, cfg.vocab_size), y.view(-1))
+                loss = _language_model_loss(
+                    model=model,
+                    lm_head=base_model.head,
+                    input_ids=x,
+                    labels=y,
+                    vocab_size=cfg.vocab_size,
+                    n_loops=n_loops,
+                    loss_chunk_tokens=args.loss_chunk_tokens,
+                )
                 loss = loss / args.grad_accum
             loss.backward()
             loss_accum += float(loss.detach())
