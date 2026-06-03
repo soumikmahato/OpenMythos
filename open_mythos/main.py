@@ -647,6 +647,7 @@ class MetaTeridMoEDispatcher(nn.Module):
         self.last_metrics: dict[str, torch.Tensor] = {}
         self.record_metrics = True
         self.graph_safe_counts = False
+        self.graph_counts: Optional[torch.Tensor] = None
 
     @staticmethod
     def _has_grouped_mm() -> bool:
@@ -693,6 +694,8 @@ class MetaTeridMoEDispatcher(nn.Module):
             counts = boundaries - torch.cat((boundaries.new_zeros(1), boundaries[:-1]))
         else:
             counts = torch.bincount(sorted_expert, minlength=self.n_experts)
+        if self.graph_counts is not None:
+            self.graph_counts.add_(counts.to(dtype=self.graph_counts.dtype))
 
         backend = self.backend
         if backend == "auto":

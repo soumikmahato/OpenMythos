@@ -14,7 +14,7 @@ except ImportError as exc:
 METATERID_TOKENIZER_NAME = "metaterid-tokenizer-v1"
 METATERID_VOCAB_SIZE = 65_536
 
-METATERID_SPECIAL_TOKENS = [
+METATERID_CORE_SPECIAL_TOKENS = [
     "<|pad|>",
     "<|unk|>",
     "<|bos|>",
@@ -33,6 +33,14 @@ METATERID_SPECIAL_TOKENS = [
     "<|fim_suffix|>",
     "<|eot|>",
 ]
+
+METATERID_FUTURE_SPECIAL_TOKENS = [
+    f"<|reserved_special_{idx:02d}|>" for idx in range(50)
+]
+
+METATERID_SPECIAL_TOKENS = (
+    METATERID_CORE_SPECIAL_TOKENS + METATERID_FUTURE_SPECIAL_TOKENS
+)
 
 
 def _ensure_tokenizers_available() -> None:

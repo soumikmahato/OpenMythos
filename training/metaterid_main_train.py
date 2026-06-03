@@ -127,6 +127,8 @@ def _update_moe_router_biases(model: torch.nn.Module) -> None:
         counts = getattr(getattr(module, "router", None), "last_metrics", {}).get(
             "tokens_per_expert"
         )
+        if counts is None:
+            counts = getattr(getattr(module, "dispatcher", None), "graph_counts", None)
         if counts is not None and dist.is_available() and dist.is_initialized():
             counts = counts.detach().to(next(module.parameters()).device).float()
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
@@ -286,6 +288,51 @@ def _convert_packed_moe_params_(model: torch.nn.Module, dtype: torch.dtype) -> N
                 layer.to(dtype)
 
 
+def _prepare_cuda_graph_modules_(model: torch.nn.Module, device: str | torch.device) -> None:
+    for module in model.modules():
+        if hasattr(module, "record_metrics"):
+            module.record_metrics = False
+        if hasattr(module, "graph_safe_counts"):
+            module.graph_safe_counts = True
+        if hasattr(module, "graph_counts"):
+            module.graph_counts = torch.zeros(
+                module.n_experts, device=device, dtype=torch.float32
+            )
+
+
+@torch.no_grad()
+def _reset_cuda_graph_moe_counts_(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        counts = getattr(module, "graph_counts", None)
+        if counts is not None:
+            counts.zero_()
+
+
+class _CudaGraphTrainBucket:
+    def __init__(
+        self,
+        *,
+        loops: int,
+        graph: torch.cuda.CUDAGraph,
+        static_x: torch.Tensor,
+        static_y: torch.Tensor,
+        loss_tensor: torch.Tensor,
+    ) -> None:
+        self.loops = loops
+        self.graph = graph
+        self.static_x = static_x
+        self.static_y = static_y
+        self.loss_tensor = loss_tensor
+
+    def replay(self, x: torch.Tensor, y: torch.Tensor, *, read_loss: bool = False) -> float | None:
+        self.static_x.copy_(x, non_blocking=True)
+        self.static_y.copy_(y, non_blocking=True)
+        self.graph.replay()
+        if not read_loss:
+            return None
+        return float(self.loss_tensor.detach())
+
+
 def _lr_by_tokens(
     tokens_seen: int,
     *,
@@ -399,7 +446,6 @@ def _backward_language_model_loss(
         if hidden_fn is not None
         else model(input_ids, n_loops=n_loops, return_hidden=True)
     )
-    hidden_shape = hidden.shape
     hidden = hidden.reshape(-1, hidden.shape[-1])
     labels = labels.reshape(-1)
     total_tokens = labels.numel()
@@ -436,8 +482,85 @@ def _backward_language_model_loss(
         scaled_aux_loss.backward(retain_graph=True)
         loss_accum += float(scaled_aux_loss.detach())
 
-    hidden.backward(hidden_grad.reshape(hidden_shape))
+    hidden.backward(hidden_grad)
     return loss_accum
+
+
+def _capture_cuda_graph_train_buckets(
+    *,
+    model: torch.nn.Module,
+    base_model: torch.nn.Module,
+    optimizer,
+    args: argparse.Namespace,
+    cfg,
+    device: str,
+    precision_dtype: torch.dtype,
+    loop_buckets: list[int],
+    hidden_fns: dict[int, Callable[[torch.Tensor], torch.Tensor]],
+    logits_fns: dict[int, Callable[[torch.Tensor], torch.Tensor]],
+) -> dict[int, _CudaGraphTrainBucket]:
+    if "cuda" not in device:
+        raise RuntimeError("--cuda-graphs requires CUDA")
+    if args.grad_accum < 1:
+        raise ValueError("--grad-accum must be >= 1")
+
+    _prepare_cuda_graph_modules_(base_model, device)
+    static_x = torch.empty(
+        args.micro_batch,
+        args.seq_len,
+        device=device,
+        dtype=torch.long,
+    )
+    static_y = torch.empty_like(static_x)
+    static_x.random_(0, cfg.vocab_size)
+    static_y.random_(0, cfg.vocab_size)
+    amp_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=precision_dtype)
+        if precision_dtype != torch.float32
+        else nullcontext()
+    )
+
+    def backward_for_loop(loops: int) -> torch.Tensor:
+        with amp_ctx:
+            loss = _language_model_loss(
+                model=model,
+                lm_head=base_model.head,
+                input_ids=static_x,
+                labels=static_y,
+                vocab_size=cfg.vocab_size,
+                n_loops=loops,
+                loss_chunk_tokens=args.loss_chunk_tokens,
+                hidden_fn=hidden_fns.get(loops),
+                logits_fn=logits_fns.get(loops),
+            )
+            scaled_loss = loss * (1.0 / args.grad_accum)
+        scaled_loss.backward()
+        return scaled_loss
+
+    buckets: dict[int, _CudaGraphTrainBucket] = {}
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for loops in loop_buckets:
+            optimizer.zero_grad(set_to_none=False)
+            backward_for_loop(loops)
+            optimizer.zero_grad(set_to_none=False)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                loss_value = backward_for_loop(loops)
+            loss_tensor = loss_value.detach()
+            buckets[loops] = _CudaGraphTrainBucket(
+                loops=loops,
+                graph=graph,
+                static_x=static_x,
+                static_y=static_y,
+                loss_tensor=loss_tensor,
+            )
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    optimizer.zero_grad(set_to_none=False)
+    _reset_cuda_graph_moe_counts_(base_model)
+    return buckets
 
 
 def parse_args() -> argparse.Namespace:
@@ -618,11 +741,10 @@ def main() -> None:
     cfg.moe_static_expert_capacity = args.moe_static_expert_capacity
     if args.find_unused_parameters is None:
         args.find_unused_parameters = getattr(cfg, "moe_impl", "legacy") != "packed"
-    if args.cuda_graphs and master:
-        logger.warning(
-            "--cuda-graphs currently enables graph-safe MoE padding and static loop "
-            "buckets, but full CUDA graph replay of the train step is not captured yet."
-        )
+    if args.cuda_graphs and ddp:
+        raise ValueError("--cuda-graphs in metaterid_main_train.py is single-H100 only for now")
+    if args.cuda_graphs and "cuda" not in device:
+        raise ValueError("--cuda-graphs requires CUDA")
     precision_dtype = _dtype_from_args(args.precision)
 
     ckpt_dir = Path(args.ckpt_dir)
@@ -734,6 +856,27 @@ def main() -> None:
             del ckpt
             gc.collect()
 
+    graph_train_buckets: dict[int, _CudaGraphTrainBucket] = {}
+    if args.cuda_graphs:
+        if not loop_buckets:
+            loop_buckets = list(range(cfg.train_min_loops, cfg.train_max_loops + 1))
+        if master:
+            logger.info(f"Capturing CUDA train graphs for loop buckets: {loop_buckets}")
+        graph_train_buckets = _capture_cuda_graph_train_buckets(
+            model=model,
+            base_model=base_model,
+            optimizer=optimizer,
+            args=args,
+            cfg=cfg,
+            device=device,
+            precision_dtype=precision_dtype,
+            loop_buckets=loop_buckets,
+            hidden_fns=loop_hidden_fns,
+            logits_fns=loop_logits_fns,
+        )
+        if master:
+            logger.info("Captured CUDA train graphs")
+
     if args.data_backend == "mmap":
         if not args.mmap_dir:
             raise ValueError("--mmap-dir is required when --data-backend=mmap")
@@ -821,8 +964,13 @@ def main() -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=not bool(graph_train_buckets))
+        if graph_train_buckets:
+            _reset_cuda_graph_moe_counts_(base_model)
         loss_accum = 0.0
+        read_graph_loss = bool(
+            graph_train_buckets and master and (step + 1) % args.log_every == 0
+        )
         for micro_step in range(args.grad_accum):
             x, y = next(data_iter)
             x = x.to(device, non_blocking=True)
@@ -838,20 +986,28 @@ def main() -> None:
                 if ddp and micro_step < args.grad_accum - 1
                 else nullcontext()
             )
-            with sync_ctx, amp_ctx:
-                loss_value = _backward_language_model_loss(
-                    model=model,
-                    lm_head=base_model.head,
-                    input_ids=x,
-                    labels=y,
-                    vocab_size=cfg.vocab_size,
-                    n_loops=n_loops,
-                    loss_chunk_tokens=args.loss_chunk_tokens,
-                    loss_scale=1.0 / args.grad_accum,
-                    hidden_fn=hidden_fn,
-                    logits_fn=logits_fn,
+            if graph_train_buckets:
+                if n_loops not in graph_train_buckets:
+                    raise RuntimeError(f"No captured CUDA graph for n_loops={n_loops}")
+                loss_value = graph_train_buckets[n_loops].replay(
+                    x, y, read_loss=read_graph_loss
                 )
-            loss_accum += loss_value
+            else:
+                with sync_ctx, amp_ctx:
+                    loss_value = _backward_language_model_loss(
+                        model=model,
+                        lm_head=base_model.head,
+                        input_ids=x,
+                        labels=y,
+                        vocab_size=cfg.vocab_size,
+                        n_loops=n_loops,
+                        loss_chunk_tokens=args.loss_chunk_tokens,
+                        loss_scale=1.0 / args.grad_accum,
+                        hidden_fn=hidden_fn,
+                        logits_fn=logits_fn,
+                    )
+            if loss_value is not None:
+                loss_accum += loss_value
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()

@@ -14,6 +14,10 @@ from open_mythos.metaterid_tokenizer import (
     train_metaterid_tokenizer,
 )
 from training.train_metaterid_tokenizer import expand_inputs
+from training.prepare_metaterid_tokenizer_corpus import (
+    HF_SOURCES,
+    clean_tokenizer_text,
+)
 
 
 def test_metaterid_tokenizer_constants():
@@ -93,3 +97,41 @@ def test_expand_inputs_accepts_directories_files_and_globs(tmp_path: Path):
     )
 
     assert expanded == [a.resolve(), b.resolve()]
+
+
+def test_tokenizer_corpus_filter_removes_separator_pollution():
+    source = HF_SOURCES["the_stack_python"]
+    polluted = """*&---------------------------------------------------------------------*
+*& Report ZIS_EXAMPLE
+*&---------------------------------------------------------------------*
+Local Interface:
+  IMPORTING
+    VALUE(foo) TYPE string
+
+def useful_function(value):
+    return value.strip().lower()
+
+----------------------------------------------------------------------
+======================================================================
+######################################################################
+"""
+
+    cleaned, reason, notes = clean_tokenizer_text(polluted, source)
+
+    assert reason is None
+    assert "useful_function" in cleaned
+    assert "Local Interface" in cleaned
+    assert "----------------" not in cleaned
+    assert "================" not in cleaned
+    assert "################" not in cleaned
+    assert notes["separator_lines_removed"] >= 3
+
+
+def test_tokenizer_corpus_filter_rejects_separator_dominated_text():
+    source = HF_SOURCES["fineweb_edu"]
+    polluted = "\n".join(["-" * 80, "=" * 80, "*" * 80, "#" * 80])
+
+    cleaned, reason, _notes = clean_tokenizer_text(polluted, source)
+
+    assert cleaned == ""
+    assert reason in {"too_short", "no_printable_text", "separator_dominated"}

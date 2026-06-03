@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 try:
@@ -64,6 +65,7 @@ PROBE_TEXTS = {
         r"Let $a,b \in \mathbb{R}$. Then $(a+b)^2 = a^2 + 2ab + b^2$.",
         r"\begin{align} y &= mx + b \\ \Delta &= b^2 - 4ac \end{align}",
         r"The loss is \(\mathcal{L} = -\sum_i y_i \log p_i\).",
+        r"```latex\n\frac{\partial \mathcal{L}}{\partial \theta} = \nabla_\theta J(\theta)\n```",
     ],
     "code": [
         "print('hello world')",
@@ -71,6 +73,7 @@ PROBE_TEXTS = {
         "const x = await fetch(url);",
         "<html><body>Hello</body></html>",
         "self.assertEqual(result, expected)",
+        "CREATE TABLE runs (id BIGINT PRIMARY KEY, status TEXT NOT NULL);",
     ],
     "tool": [
         "<|tool_call|>{\"name\":\"web_search\",\"arguments\":{\"query\":\"weather\"}}<|eot|>",
@@ -85,6 +88,10 @@ PROBE_TEXTS = {
     ],
 }
 
+POLLUTED_TOKEN_RE = re.compile(
+    r"([ \t])\1{7,}|([\-_=*#~])\2{7,}|^[\-_=*#~\s]{10,}$"
+)
+
 
 def _load_tokenizer(path: Path) -> PreTrainedTokenizerFast:
     return PreTrainedTokenizerFast.from_pretrained(path)
@@ -94,6 +101,49 @@ def _format_tokens(tokens: list[str], max_tokens: int) -> str:
     shown = tokens[:max_tokens]
     suffix = "" if len(tokens) <= max_tokens else f" ... (+{len(tokens) - max_tokens})"
     return " ".join(repr(token) for token in shown) + suffix
+
+
+def _decoded_vocab_token(tok: PreTrainedTokenizerFast, token_id: int, raw_token: str) -> str:
+    try:
+        decoded = tok.decode([token_id], clean_up_tokenization_spaces=False)
+    except TypeError:
+        decoded = tok.decode([token_id])
+    except Exception:
+        decoded = ""
+    return decoded if decoded else raw_token
+
+
+def _pollution_report(
+    tok: PreTrainedTokenizerFast,
+    id_to_token: dict[int, str],
+    *,
+    max_examples: int,
+) -> dict:
+    polluted: list[dict] = []
+    punctuation_heavy: list[dict] = []
+    whitespace_tokens: list[dict] = []
+
+    for token_id, raw_token in sorted(id_to_token.items()):
+        decoded = _decoded_vocab_token(tok, token_id, raw_token)
+        visible = decoded.strip()
+        if POLLUTED_TOKEN_RE.search(decoded):
+            polluted.append({"id": token_id, "token": raw_token, "decoded": decoded})
+        if decoded and len(decoded) >= 10 and not visible:
+            whitespace_tokens.append({"id": token_id, "token": raw_token, "decoded": decoded})
+        if (
+            len(visible) >= 12
+            and sum(ch in "-_=*#~" for ch in visible) / max(1, len(visible)) > 0.7
+        ):
+            punctuation_heavy.append({"id": token_id, "token": raw_token, "decoded": decoded})
+
+    return {
+        "polluted_count": len(polluted),
+        "punctuation_heavy_count": len(punctuation_heavy),
+        "whitespace_token_count": len(whitespace_tokens),
+        "examples": polluted[:max_examples],
+        "punctuation_heavy_examples": punctuation_heavy[:max_examples],
+        "whitespace_examples": whitespace_tokens[:max_examples],
+    }
 
 
 def inspect_tokenizer(path: Path, *, max_tokens: int = 40) -> dict:
@@ -181,6 +231,16 @@ def inspect_tokenizer(path: Path, *, max_tokens: int = 40) -> dict:
         print(f"{idx:6d} {id_to_token[idx]!r}")
     print()
 
+    pollution = _pollution_report(tok, id_to_token, max_examples=max_tokens)
+    print("Pollution probes")
+    print("-" * 80)
+    print(f"polluted_count={pollution['polluted_count']}")
+    print(f"punctuation_heavy_count={pollution['punctuation_heavy_count']}")
+    print(f"whitespace_token_count={pollution['whitespace_token_count']}")
+    for item in pollution["examples"]:
+        print(f"id={item['id']:6d} token={item['token']!r} decoded={item['decoded']!r}")
+    print()
+
     group_summary = {}
     for group, _text, n_tokens, n_chars, fertility in fertility_rows:
         group_summary.setdefault(group, []).append(fertility)
@@ -196,6 +256,7 @@ def inspect_tokenizer(path: Path, *, max_tokens: int = 40) -> dict:
         "missing_special_tokens": missing,
         "special_tokens": special_report,
         "vocab_hits": vocab_hits,
+        "pollution": pollution,
         "fertility": [
             {
                 "group": group,
@@ -214,12 +275,25 @@ def main() -> None:
     parser.add_argument("--tokenizer", required=True, help="Tokenizer directory.")
     parser.add_argument("--output", default=None, help="Optional JSON report path.")
     parser.add_argument("--max-tokens", type=int, default=40)
+    parser.add_argument(
+        "--fail-on-pollution",
+        action="store_true",
+        help="Exit non-zero if long whitespace/separator tokens entered the vocabulary.",
+    )
     args = parser.parse_args()
 
     report = inspect_tokenizer(Path(args.tokenizer), max_tokens=args.max_tokens)
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"Wrote {args.output}")
+    if args.fail_on_pollution:
+        pollution = report["pollution"]
+        if (
+            pollution["polluted_count"]
+            or pollution["punctuation_heavy_count"]
+            or pollution["whitespace_token_count"]
+        ):
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":
