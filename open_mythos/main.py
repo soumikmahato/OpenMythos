@@ -71,7 +71,7 @@ class MythosConfig:
     n_experts_per_tok: int = 4  # top-K routed
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
     moe_impl: str = "legacy"  # "legacy" | "packed"
-    moe_backend: str = "auto"  # "auto" | "padded" | "sorted"
+    moe_backend: str = "auto"  # "auto" | "grouped_mm" | "padded" | "sorted"
     moe_dispatcher: str = "local_packed"
     router_score_function: str = "softmax"  # "softmax" | "sigmoid"
     normalize_topk: bool = True
@@ -157,6 +157,22 @@ def precompute_rope_freqs(
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
+def precompute_rope_cos_sin(
+    dim: int, max_len: int, theta: float = 500000.0
+) -> torch.Tensor:
+    """
+    Precompute real-valued RoPE cos/sin pairs for compiler-friendly training.
+
+    The public precompute_rope_freqs API keeps returning complex phasors for
+    compatibility with older tests and utilities. Model forward passes use this
+    real layout to avoid complex operators in torch.compile/Inductor graphs.
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    t = torch.arange(max_len, dtype=torch.float32)
+    angles = torch.outer(t, freqs)
+    return torch.stack((angles.cos(), angles.sin()), dim=-1)
+
+
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     Apply rotary positional embeddings to query or key tensors.
@@ -167,19 +183,29 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2),
+        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2)
+                     or real cos/sin pairs of shape (T, head_dim//2, 2),
                      already sliced to exactly the positions being processed
                      (caller is responsible for correct start_pos offset)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return (
-        torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
-        .flatten(-2)
-        .to(x.dtype)
+    x_pair = x.float().reshape(*x.shape[:-1], -1, 2)
+    if freqs_cis.is_complex():
+        cos = freqs_cis.real
+        sin = freqs_cis.imag
+    else:
+        cos = freqs_cis[..., 0]
+        sin = freqs_cis[..., 1]
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    x_even = x_pair[..., 0]
+    x_odd = x_pair[..., 1]
+    rotated = torch.stack(
+        (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1
     )
+    return rotated.flatten(-2).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +627,25 @@ class MetaTeridMoEDispatcher(nn.Module):
         self.static_expert_capacity = cfg.moe_static_expert_capacity
         self.last_metrics: dict[str, torch.Tensor] = {}
 
+    @staticmethod
+    def _has_grouped_mm() -> bool:
+        return hasattr(F, "grouped_mm")
+
+    def _can_grouped_mm(
+        self,
+        sorted_x: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> bool:
+        return (
+            self._has_grouped_mm()
+            and sorted_x.is_cuda
+            and gate_weight.dtype == torch.bfloat16
+            and up_weight.dtype == torch.bfloat16
+            and down_weight.dtype == torch.bfloat16
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -622,8 +667,24 @@ class MetaTeridMoEDispatcher(nn.Module):
         sorted_x = x.index_select(0, sorted_token)
         counts = torch.bincount(sorted_expert, minlength=self.n_experts)
 
-        backend = "padded" if self.backend == "auto" else self.backend
-        if backend == "padded":
+        backend = self.backend
+        if backend == "auto":
+            backend = (
+                "grouped_mm"
+                if self._can_grouped_mm(sorted_x, gate_weight, up_weight, down_weight)
+                else "padded"
+            )
+        if backend == "grouped_mm":
+            if not self._can_grouped_mm(sorted_x, gate_weight, up_weight, down_weight):
+                raise RuntimeError(
+                    "moe_backend='grouped_mm' requires CUDA and BF16 packed expert "
+                    "weights. Use --model-param-dtype bf16 or "
+                    "moe_backend='padded'."
+                )
+            sorted_out = self._torch_grouped_mm(
+                sorted_x, counts, gate_weight, up_weight, down_weight
+            )
+        elif backend == "padded":
             sorted_out = self._padded_grouped(
                 sorted_x, sorted_expert, counts, gate_weight, up_weight, down_weight
             )
@@ -642,8 +703,24 @@ class MetaTeridMoEDispatcher(nn.Module):
                 "tokens_per_expert": counts.detach(),
                 "expert_load_max": counts.max().detach(),
                 "expert_load_mean": counts.float().mean().detach(),
-            }
+        }
         return out
+
+    def _torch_grouped_mm(
+        self,
+        sorted_x: torch.Tensor,
+        counts: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = sorted_x.dtype
+        sorted_x = sorted_x if sorted_x.dtype == torch.bfloat16 else sorted_x.to(torch.bfloat16)
+        offs = counts.cumsum(0).to(torch.int32)
+        gate = F.grouped_mm(sorted_x, gate_weight.transpose(1, 2), offs=offs)
+        up = F.grouped_mm(sorted_x, up_weight.transpose(1, 2), offs=offs)
+        hidden = F.silu(gate) * up
+        return F.grouped_mm(hidden, down_weight.transpose(1, 2), offs=offs).to(orig_dtype)
 
     def _padded_grouped(
         self,
@@ -932,6 +1009,21 @@ def loop_index_embedding(
     return h + emb_full.unsqueeze(0).unsqueeze(0)
 
 
+def precompute_loop_index_embeddings(
+    model_dim: int, loop_dim: int, max_loops: int, theta: float = 10000.0
+) -> torch.Tensor:
+    """Precompute loop-index embeddings as a real table for compiled training."""
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, loop_dim, 2, dtype=torch.float32) / loop_dim)
+    )
+    loop_idx = torch.arange(max_loops, dtype=torch.float32).unsqueeze(1)
+    angles = loop_idx * freqs.unsqueeze(0)
+    emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:, :loop_dim]
+    table = torch.zeros(max_loops, model_dim, dtype=torch.float32)
+    table[:, :loop_dim] = emb
+    return table
+
+
 # ---------------------------------------------------------------------------
 # Depth-wise LoRA adapter (per loop iteration)
 # ---------------------------------------------------------------------------
@@ -974,10 +1066,13 @@ class LoRAAdapter(nn.Module):
         # Clamp for depth extrapolation: at inference n_loops can exceed the
         # training max_loop_iters. Iterations beyond the trained range reuse
         # the last learned per-loop scale rather than indexing out of range.
-        max_t = self.scale.num_embeddings - 1
-        t_idx = loop_t if loop_t <= max_t else max_t
-        s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
-        down = self.down(x) * s  # (B, T, rank)
+        t_idx = min(loop_t, self.scale.num_embeddings - 1)
+        s = self.scale.weight[t_idx]  # (rank,)
+        return self.forward_with_scale(x, s)
+
+    def forward_with_scale(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Apply the adapter with an already-selected per-loop scale tensor."""
+        down = self.down(x) * scale  # (B, T, rank)
         return down @ self.B  # (B, T, dim)
 
 
@@ -1183,6 +1278,10 @@ class RecurrentBlock(nn.Module):
         self.loop_dim = (
             cfg.dim // 8
         )  # fraction of channels receiving loop-index embedding
+        self.register_buffer(
+            "loop_index_table",
+            precompute_loop_index_embeddings(cfg.dim, self.loop_dim, cfg.max_loop_iters),
+        )
 
     def forward(
         self,
@@ -1217,11 +1316,17 @@ class RecurrentBlock(nn.Module):
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            if t < self.loop_index_table.size(0):
+                loop_emb = self.loop_index_table[t].to(dtype=h.dtype)
+                h_loop = h + loop_emb.view(1, 1, D)
+                lora_scale = self.lora.scale.weight[t]
+            else:
+                h_loop = loop_index_embedding(h, t, self.loop_dim)
+                lora_scale = self.lora.scale.weight[-1]
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
-            trans_out = trans_out + self.lora(trans_out, t)
+            trans_out = trans_out + self.lora.forward_with_scale(trans_out, lora_scale)
             h = self.injection(h, e, trans_out)
 
             p = self.act(h)  # (B, T)
@@ -1296,11 +1401,11 @@ class OpenMythos(nn.Module):
         self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
 
         # GQA uses full head_dim for RoPE; MLA uses only qk_rope_head_dim (decoupled)
-        freqs = precompute_rope_freqs(
+        freqs = precompute_rope_cos_sin(
             cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta
         )
         self.register_buffer("freqs_cis", freqs)
-        freqs_mla = precompute_rope_freqs(
+        freqs_mla = precompute_rope_cos_sin(
             cfg.qk_rope_head_dim, cfg.max_seq_len, cfg.rope_theta
         )
         self.register_buffer("freqs_cis_mla", freqs_mla)

@@ -170,3 +170,22 @@ def test_padded_moe_static_capacity_overflow_is_explicit():
 
     with pytest.raises(RuntimeError, match="capacity overflow"):
         moe(torch.randn(1, 3, cfg.dim))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch.nn.functional, "grouped_mm"),
+    reason="torch grouped_mm MoE backend requires CUDA and PyTorch grouped_mm",
+)
+def test_grouped_mm_backend_matches_padded_cuda_bf16():
+    torch.manual_seed(2)
+    cfg_padded = moe_cfg(moe_impl="packed", moe_backend="padded")
+    cfg_grouped = moe_cfg(moe_impl="packed", moe_backend="grouped_mm")
+    padded = MoEFFN(cfg_padded).cuda().to(torch.bfloat16)
+    grouped = MoEFFN(cfg_grouped).cuda().to(torch.bfloat16)
+    grouped.load_state_dict(padded.state_dict())
+    x = torch.randn(2, 8, cfg_padded.dim, device="cuda", dtype=torch.bfloat16)
+
+    out_padded = padded(x)
+    out_grouped = grouped(x)
+
+    assert torch.allclose(out_grouped.float(), out_padded.float(), atol=2e-2, rtol=2e-2)

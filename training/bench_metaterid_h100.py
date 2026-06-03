@@ -46,6 +46,28 @@ def dtype_from_arg(value: str) -> torch.dtype:
     return torch.float16
 
 
+def param_dtype_from_arg(value: str) -> torch.dtype | None:
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp16":
+        return torch.float16
+    return None
+
+
+def convert_packed_moe_params_(model: torch.nn.Module, dtype: torch.dtype) -> None:
+    for module in model.modules():
+        if getattr(module, "impl", None) != "packed":
+            continue
+        for name in ("routed_gate_weight", "routed_up_weight", "routed_down_weight"):
+            param = getattr(module, name, None)
+            if param is not None:
+                param.data = param.data.to(dtype)
+        for name in ("shared_gate", "shared_up", "shared_down"):
+            layer = getattr(module, name, None)
+            if layer is not None:
+                layer.to(dtype)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", default="metaterid_1b", choices=["metaterid_1b", "t4_pilot"])
@@ -57,9 +79,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--loss-chunk-tokens", type=int, default=8192)
     parser.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
+    parser.add_argument(
+        "--model-param-dtype",
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help=(
+            "Optional parameter dtype conversion before benchmarking. "
+            "Use bf16 to enable torch grouped_mm MoE on H100."
+        ),
+    )
+    parser.add_argument(
+        "--moe-param-dtype",
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help=(
+            "Convert only packed MoE expert/shared weights. bf16 enables "
+            "grouped_mm while keeping router/norm/embed/head params in fp32."
+        ),
+    )
     parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adam", "adamw_muon", "muon"])
     parser.add_argument("--moe-impl", default="packed", choices=["legacy", "packed"])
-    parser.add_argument("--moe-backend", default="auto", choices=["auto", "padded", "sorted"])
+    parser.add_argument(
+        "--moe-backend",
+        default="auto",
+        choices=["auto", "grouped_mm", "padded", "sorted"],
+    )
     parser.add_argument("--moe-pad-for-cuda-graphs", action="store_true")
     parser.add_argument("--moe-graph-capacity-factor", type=float, default=1.25)
     parser.add_argument("--moe-static-expert-capacity", type=int, default=0)
@@ -123,6 +167,12 @@ def main() -> None:
     cfg.router_score_function = args.router_score_function
 
     model = MetaTeridForCausalLM(cfg).to(device)
+    model_dtype = param_dtype_from_arg(args.model_param_dtype)
+    if model_dtype is not None:
+        model = model.to(model_dtype)
+    moe_dtype = param_dtype_from_arg(args.moe_param_dtype)
+    if moe_dtype is not None:
+        convert_packed_moe_params_(model, moe_dtype)
     if args.compile:
         model = torch.compile(model, dynamic=False)
     optimizer = build_optimizer(model, name=args.optimizer, lr=3e-4, weight_decay=0.1)
@@ -173,6 +223,8 @@ def main() -> None:
         "micro_batch": args.micro_batch,
         "loops": args.loops,
         "precision": str(precision),
+        "model_param_dtype": args.model_param_dtype,
+        "moe_param_dtype": args.moe_param_dtype,
         "mean_step_s": mean_step,
         "tok_per_s": tokens / mean_step,
         "cuda_max_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,

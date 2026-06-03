@@ -15,6 +15,7 @@ from open_mythos.main import (
     TransformerBlock,
     apply_rope,
     loop_index_embedding,
+    precompute_rope_cos_sin,
     precompute_rope_freqs,
 )
 
@@ -98,6 +99,14 @@ class TestRoPE:
         x = torch.randn(B, T, 4, 16)
         out = apply_rope(x, freqs[:T])
         assert out.shape == x.shape
+
+    def test_apply_rope_real_cos_sin_matches_complex(self):
+        freqs = precompute_rope_freqs(dim=16, max_len=32)
+        freqs_real = precompute_rope_cos_sin(dim=16, max_len=32)
+        x = torch.randn(B, T, 4, 16)
+        out_complex = apply_rope(x, freqs[:T])
+        out_real = apply_rope(x, freqs_real[:T])
+        assert torch.allclose(out_real, out_complex, atol=1e-6)
 
     def test_apply_rope_preserves_norm(self):
         # rotation is an isometry — norms must be unchanged

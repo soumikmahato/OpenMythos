@@ -15,6 +15,7 @@ from open_mythos.main import (
     TransformerBlock,
     apply_rope,
     loop_index_embedding,
+    precompute_rope_cos_sin,
     precompute_rope_freqs,
 )
 from open_mythos.tokenizer import MythosTokenizer
@@ -58,6 +59,7 @@ __all__ = [
     "RecurrentBlock",
     "OpenMythos",
     "precompute_rope_freqs",
+    "precompute_rope_cos_sin",
     "apply_rope",
     "loop_index_embedding",
     "mythos_1b",

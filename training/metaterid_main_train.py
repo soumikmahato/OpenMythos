@@ -257,6 +257,28 @@ def _dtype_from_args(value: str) -> torch.dtype:
     raise ValueError(f"Unknown precision: {value}")
 
 
+def _param_dtype_from_args(value: str) -> torch.dtype | None:
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp16":
+        return torch.float16
+    return None
+
+
+def _convert_packed_moe_params_(model: torch.nn.Module, dtype: torch.dtype) -> None:
+    for module in model.modules():
+        if getattr(module, "impl", None) != "packed":
+            continue
+        for name in ("routed_gate_weight", "routed_up_weight", "routed_down_weight"):
+            param = getattr(module, name, None)
+            if param is not None:
+                param.data = param.data.to(dtype)
+        for name in ("shared_gate", "shared_up", "shared_down"):
+            layer = getattr(module, name, None)
+            if layer is not None:
+                layer.to(dtype)
+
+
 def _lr_by_tokens(
     tokens_seen: int,
     *,
@@ -474,6 +496,24 @@ def parse_args() -> argparse.Namespace:
         help="Switch optimizer after this fraction of target tokens. Use >=1 to disable.",
     )
     parser.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
+    parser.add_argument(
+        "--model-param-dtype",
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help=(
+            "Convert model parameters before training. bf16 enables the "
+            "torch grouped_mm MoE backend on H100; fp32 keeps the mixed-precision default."
+        ),
+    )
+    parser.add_argument(
+        "--moe-param-dtype",
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help=(
+            "Convert only packed MoE expert/shared weights before training. "
+            "bf16 enables grouped_mm while keeping router/norm/embed/head params in fp32."
+        ),
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile-loop-buckets", action="store_true")
     parser.add_argument("--loop-buckets", default="4-16")
@@ -483,7 +523,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moe-graph-capacity-factor", type=float, default=1.25)
     parser.add_argument("--moe-static-expert-capacity", type=int, default=0)
     parser.add_argument("--moe-impl", default="", choices=["", "legacy", "packed"])
-    parser.add_argument("--moe-backend", default="", choices=["", "auto", "padded", "sorted"])
+    parser.add_argument(
+        "--moe-backend",
+        default="",
+        choices=["", "auto", "grouped_mm", "padded", "sorted"],
+    )
     parser.add_argument("--auto-micro-batch", action="store_true")
     parser.add_argument("--router-score-function", default="", choices=["", "softmax", "sigmoid"])
     parser.add_argument("--resume", action="store_true")
@@ -591,6 +635,13 @@ def main() -> None:
             gc.collect()
             if master:
                 logger.info(f"Resumed model from {latest} at {tokens_seen:,} tokens")
+
+    model_dtype = _param_dtype_from_args(args.model_param_dtype)
+    if model_dtype is not None:
+        base_model = base_model.to(model_dtype)
+    moe_dtype = _param_dtype_from_args(args.moe_param_dtype)
+    if moe_dtype is not None:
+        _convert_packed_moe_params_(base_model, moe_dtype)
 
     target_tokens = args.target_tokens
     if args.additional_tokens > 0:
@@ -712,9 +763,11 @@ def main() -> None:
         logger.info(
             f"variant={args.variant} mix={args.mix} ddp={ddp} world_size={world_size} "
             f"data_backend={args.data_backend} moe_impl={getattr(cfg, 'moe_impl', 'legacy')} "
+            f"moe_backend={getattr(cfg, 'moe_backend', 'auto')} "
             f"seq_len={args.seq_len} micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
             f"global_batch_tokens={global_batch_tokens:,} target_tokens={target_tokens:,} "
             f"optimizer={optimizer_name} precision={precision_dtype} "
+            f"model_param_dtype={args.model_param_dtype} moe_param_dtype={args.moe_param_dtype} "
             f"find_unused_parameters={args.find_unused_parameters}"
         )
         if args.log_memory:
