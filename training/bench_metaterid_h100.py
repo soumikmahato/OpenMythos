@@ -68,6 +68,14 @@ def convert_packed_moe_params_(model: torch.nn.Module, dtype: torch.dtype) -> No
                 layer.to(dtype)
 
 
+def prepare_cuda_graph_modules_(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        if hasattr(module, "record_metrics"):
+            module.record_metrics = False
+        if hasattr(module, "graph_safe_counts"):
+            module.graph_safe_counts = True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", default="metaterid_1b", choices=["metaterid_1b", "t4_pilot"])
@@ -113,6 +121,14 @@ def parse_args() -> argparse.Namespace:
         "--compile-mode",
         default="default",
         choices=["default", "reduce-overhead", "max-autotune"],
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help=(
+            "Capture forward + chunked loss + backward for the static synthetic "
+            "benchmark. Optimizer step and grad clipping stay outside the graph."
+        ),
     )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
@@ -178,6 +194,8 @@ def main() -> None:
     moe_dtype = param_dtype_from_arg(args.moe_param_dtype)
     if moe_dtype is not None:
         convert_packed_moe_params_(model, moe_dtype)
+    if args.cuda_graphs:
+        prepare_cuda_graph_modules_(model)
     if args.compile:
         compile_kwargs = {"dynamic": False}
         if args.compile_mode != "default":
@@ -196,13 +214,9 @@ def main() -> None:
     y = torch.randint(
         0, cfg.vocab_size, (args.micro_batch, args.seq_len), device=device
     )
-    total_steps = args.warmup_steps + args.steps
     timings = []
 
-    for step in range(total_steps):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
+    def backward_pass() -> torch.Tensor:
         with amp_ctx:
             loss = chunked_loss(
                 model,
@@ -214,11 +228,47 @@ def main() -> None:
                 args.loss_chunk_tokens,
             )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        return loss
+
+    if args.cuda_graphs:
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            for _ in range(args.warmup_steps):
+                optimizer.zero_grad(set_to_none=False)
+                backward_pass()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=False)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+
+        graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
-        if step >= args.warmup_steps:
+        with torch.cuda.graph(graph, stream=capture_stream):
+            backward_pass()
+        torch.cuda.synchronize()
+
+        for _ in range(args.steps):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            optimizer.zero_grad(set_to_none=False)
+            graph.replay()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            torch.cuda.synchronize()
             timings.append(time.perf_counter() - t0)
+    else:
+        total_steps = args.warmup_steps + args.steps
+        for step in range(total_steps):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            backward_pass()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if step >= args.warmup_steps:
+                timings.append(time.perf_counter() - t0)
 
     tokens = args.micro_batch * args.seq_len
     mean_step = sum(timings) / len(timings)
@@ -235,6 +285,7 @@ def main() -> None:
         "moe_param_dtype": args.moe_param_dtype,
         "compile": args.compile,
         "compile_mode": args.compile_mode,
+        "cuda_graphs": args.cuda_graphs,
         "mean_step_s": mean_step,
         "tok_per_s": tokens / mean_step,
         "cuda_max_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,

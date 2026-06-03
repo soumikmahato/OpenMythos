@@ -51,13 +51,11 @@ class MetaTeridForCausalLM(OpenMythos):
         return_hidden: bool = False,
     ) -> torch.Tensor:
         T = input_ids.shape[1]
-        device = input_ids.device
-
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
         )[start_pos : start_pos + T]
-        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
+        mask = True if T > 1 else None
 
         sources: list[torch.Tensor] = [x]
 

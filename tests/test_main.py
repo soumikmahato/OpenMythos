@@ -295,6 +295,11 @@ class TestGQAttention:
         out = self.attn(x, self.freqs, mask=mask)
         assert out.shape == (B, T, self.cfg.dim)
 
+    def test_with_causal_sentinel(self):
+        x = torch.randn(B, T, self.cfg.dim)
+        out = self.attn(x, self.freqs, mask=True)
+        assert out.shape == (B, T, self.cfg.dim)
+
 
 # ---------------------------------------------------------------------------
 # MLAttention
@@ -335,6 +340,11 @@ class TestMLAttention:
         x = torch.randn(B, T, self.cfg.dim)
         mask = torch.triu(torch.full((1, 1, T, T), float("-inf")), diagonal=1)
         out = self.attn(x, self.freqs, mask=mask)
+        assert out.shape == (B, T, self.cfg.dim)
+
+    def test_with_causal_sentinel(self):
+        x = torch.randn(B, T, self.cfg.dim)
+        out = self.attn(x, self.freqs, mask=True)
         assert out.shape == (B, T, self.cfg.dim)
 
 

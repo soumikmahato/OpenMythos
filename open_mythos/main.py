@@ -14,6 +14,10 @@ except ImportError:
     _HAS_FLASH_ATTN = False
 
 
+def _is_cuda_graph_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 @dataclass
 class MythosConfig:
     """
@@ -191,6 +195,13 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
+    seq_len = x.shape[1]
+    if freqs_cis.size(0) < seq_len:
+        raise RuntimeError(
+            f"RoPE frequency table length {freqs_cis.size(0)} is shorter than sequence length {seq_len}"
+        )
+    if freqs_cis.size(0) != seq_len:
+        freqs_cis = freqs_cis[:seq_len]
     x_pair = x.float().reshape(*x.shape[:-1], -1, 2)
     if freqs_cis.is_complex():
         cos = freqs_cis.real
@@ -252,7 +263,7 @@ class GQAttention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor | bool] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
     ) -> torch.Tensor:
@@ -291,9 +302,7 @@ class GQAttention(nn.Module):
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
             dropout_p = self.dropout_p if self.training else 0.0
-            out = flash_attn_func(
-                q, k, v, dropout_p=dropout_p, causal=(mask is not None)
-            )
+            out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=bool(mask))
             out = out.to(orig_dtype).contiguous().view(B, T, -1)
         else:
             # Fallback: PyTorch SDPA with explicit KV head expansion. On H100,
@@ -304,12 +313,12 @@ class GQAttention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             dropout_p = self.dropout_p if self.training else 0.0
-            use_causal = mask is not None and q.size(-2) == k.size(-2)
+            use_causal = mask is True or (mask is not None and q.size(-2) == k.size(-2))
             out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=None if use_causal else mask,
+                attn_mask=None if use_causal or mask is True else mask,
                 dropout_p=dropout_p,
                 is_causal=use_causal,
             )
@@ -393,7 +402,7 @@ class MLAttention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor | bool] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
     ) -> torch.Tensor:
@@ -451,12 +460,12 @@ class MLAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
         dropout_p = self.attn_drop.p if self.training else 0.0
-        use_causal = mask is not None and q.size(-2) == k.size(-2)
+        use_causal = mask is True or (mask is not None and q.size(-2) == k.size(-2))
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None if use_causal else mask,
+            attn_mask=None if use_causal or mask is True else mask,
             dropout_p=dropout_p,
             is_causal=use_causal,
         )
@@ -536,6 +545,7 @@ class MetaTeridMoERouter(nn.Module):
         self.register_buffer("router_bias", torch.zeros(n_experts))
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.last_metrics: dict[str, torch.Tensor] = {}
+        self.record_metrics = True
 
     def forward(
         self,
@@ -590,6 +600,8 @@ class MetaTeridMoERouter(nn.Module):
         )
 
     def _record_metrics(self, scores: torch.Tensor, topk_idx: torch.Tensor) -> None:
+        if not self.record_metrics or (scores.is_cuda and _is_cuda_graph_capturing()):
+            return
         with torch.no_grad():
             counts = torch.bincount(topk_idx.reshape(-1), minlength=self.n_experts)
             probs = scores.mean(dim=0)
@@ -633,6 +645,8 @@ class MetaTeridMoEDispatcher(nn.Module):
         self.capacity_factor = cfg.moe_graph_capacity_factor
         self.static_expert_capacity = cfg.moe_static_expert_capacity
         self.last_metrics: dict[str, torch.Tensor] = {}
+        self.record_metrics = True
+        self.graph_safe_counts = False
 
     @staticmethod
     def _has_grouped_mm() -> bool:
@@ -665,14 +679,20 @@ class MetaTeridMoEDispatcher(nn.Module):
         n_tokens, dim = x.shape
         flat_expert = topk_idx.reshape(-1)
         flat_weight = topk_weight.reshape(-1)
-        token_idx = torch.arange(n_tokens, device=x.device).repeat_interleave(self.topk)
 
-        order = flat_expert.argsort(stable=True)
+        order = flat_expert.argsort()
         sorted_expert = flat_expert[order]
-        sorted_token = token_idx[order]
+        sorted_token = torch.div(order, self.topk, rounding_mode="floor")
         sorted_weight = flat_weight[order]
         sorted_x = x.index_select(0, sorted_token)
-        counts = torch.bincount(sorted_expert, minlength=self.n_experts)
+        if self.graph_safe_counts:
+            expert_ids = torch.arange(
+                self.n_experts, device=sorted_expert.device, dtype=sorted_expert.dtype
+            )
+            boundaries = torch.searchsorted(sorted_expert, expert_ids, right=True)
+            counts = boundaries - torch.cat((boundaries.new_zeros(1), boundaries[:-1]))
+        else:
+            counts = torch.bincount(sorted_expert, minlength=self.n_experts)
 
         backend = self.backend
         if backend == "auto":
@@ -705,12 +725,13 @@ class MetaTeridMoEDispatcher(nn.Module):
         sorted_out = sorted_out * sorted_weight.unsqueeze(-1)
         out = x.new_zeros(n_tokens, dim)
         out.index_add_(0, sorted_token, sorted_out)
-        with torch.no_grad():
-            self.last_metrics = {
-                "tokens_per_expert": counts.detach(),
-                "expert_load_max": counts.max().detach(),
-                "expert_load_mean": counts.float().mean().detach(),
-        }
+        if self.record_metrics and not (x.is_cuda and _is_cuda_graph_capturing()):
+            with torch.no_grad():
+                self.last_metrics = {
+                    "tokens_per_expert": counts.detach(),
+                    "expert_load_max": counts.max().detach(),
+                    "expert_load_mean": counts.float().mean().detach(),
+                }
         return out
 
     def _torch_grouped_mm(
@@ -1118,7 +1139,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor | bool] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
     ) -> torch.Tensor:
@@ -1295,7 +1316,7 @@ class RecurrentBlock(nn.Module):
         h: torch.Tensor,
         e: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor | bool] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
@@ -1315,6 +1336,7 @@ class RecurrentBlock(nn.Module):
         Returns:
             ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
         """
+        fixed_loop_count = n_loops is not None
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
 
@@ -1359,7 +1381,7 @@ class RecurrentBlock(nn.Module):
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
+            if not fixed_loop_count and halted.all() and kv_cache is None:
                 break
 
         return h_out
@@ -1488,13 +1510,11 @@ class OpenMythos(nn.Module):
             Logits of shape (B, T, vocab_size)
         """
         T = input_ids.shape[1]
-        device = input_ids.device
-
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
         )[start_pos : start_pos + T]
-        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
+        mask = True if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
