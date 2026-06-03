@@ -155,7 +155,14 @@ def _moe_metrics_summary(model: torch.nn.Module) -> str:
     return " ".join(parts)
 
 
-def _build_loop_bucket_fns(model: torch.nn.Module, buckets: list[int]):
+def _compile_callable(fn: Callable[[torch.Tensor], torch.Tensor], mode: str):
+    kwargs = {"dynamic": False}
+    if mode != "default":
+        kwargs["mode"] = mode
+    return torch.compile(fn, **kwargs)
+
+
+def _build_loop_bucket_fns(model: torch.nn.Module, buckets: list[int], compile_mode: str):
     hidden_fns: dict[int, Callable[[torch.Tensor], torch.Tensor]] = {}
     logits_fns: dict[int, Callable[[torch.Tensor], torch.Tensor]] = {}
     for loops in buckets:
@@ -165,8 +172,8 @@ def _build_loop_bucket_fns(model: torch.nn.Module, buckets: list[int]):
         def logits_fn(input_ids, *, _loops=loops):
             return model(input_ids, n_loops=_loops)
 
-        hidden_fns[loops] = torch.compile(hidden_fn, dynamic=False)
-        logits_fns[loops] = torch.compile(logits_fn, dynamic=False)
+        hidden_fns[loops] = _compile_callable(hidden_fn, compile_mode)
+        logits_fns[loops] = _compile_callable(logits_fn, compile_mode)
     return hidden_fns, logits_fns
 
 
@@ -515,6 +522,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
     parser.add_argument("--compile-loop-buckets", action="store_true")
     parser.add_argument("--loop-buckets", default="4-16")
     parser.add_argument("--loop-schedule", default="random", choices=["random", "bucketed"])
@@ -667,7 +679,7 @@ def main() -> None:
 
     model = base_model
     if args.compile and not args.compile_loop_buckets:
-        model = torch.compile(model)
+        model = _compile_callable(model, args.compile_mode)
 
     if ddp:
         model = DDP(
@@ -683,9 +695,11 @@ def main() -> None:
     loop_logits_fns = {}
     loop_buckets = _parse_loop_buckets(args.loop_buckets)
     if args.compile_loop_buckets:
-        loop_hidden_fns, loop_logits_fns = _build_loop_bucket_fns(model, loop_buckets)
+        loop_hidden_fns, loop_logits_fns = _build_loop_bucket_fns(
+            model, loop_buckets, args.compile_mode
+        )
         if master:
-            logger.info(f"Compiled loop buckets: {loop_buckets}")
+            logger.info(f"Compiled loop buckets: {loop_buckets} mode={args.compile_mode}")
 
     switch_tokens = int(target_tokens * args.muon_switch_ratio)
     optimizer_name = (

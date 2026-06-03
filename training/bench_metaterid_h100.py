@@ -109,6 +109,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moe-static-expert-capacity", type=int, default=0)
     parser.add_argument("--router-score-function", default="sigmoid", choices=["softmax", "sigmoid"])
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
@@ -174,7 +179,10 @@ def main() -> None:
     if moe_dtype is not None:
         convert_packed_moe_params_(model, moe_dtype)
     if args.compile:
-        model = torch.compile(model, dynamic=False)
+        compile_kwargs = {"dynamic": False}
+        if args.compile_mode != "default":
+            compile_kwargs["mode"] = args.compile_mode
+        model = torch.compile(model, **compile_kwargs)
     optimizer = build_optimizer(model, name=args.optimizer, lr=3e-4, weight_decay=0.1)
     amp_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=precision)
@@ -225,6 +233,8 @@ def main() -> None:
         "precision": str(precision),
         "model_param_dtype": args.model_param_dtype,
         "moe_param_dtype": args.moe_param_dtype,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode,
         "mean_step_s": mean_step,
         "tok_per_s": tokens / mean_step,
         "cuda_max_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,

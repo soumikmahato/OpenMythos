@@ -296,20 +296,23 @@ class GQAttention(nn.Module):
             )
             out = out.to(orig_dtype).contiguous().view(B, T, -1)
         else:
-            # Fallback: manual scaled dot-product with explicit KV head expansion.
+            # Fallback: PyTorch SDPA with explicit KV head expansion. On H100,
+            # this routes training prefill shapes to Flash-SDPA when available.
             k = k.repeat_interleave(self.groups, dim=2)
             v = v.repeat_interleave(self.groups, dim=2)
             q = q.transpose(1, 2)  # (B, H, T, head_dim)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            scale = self.head_dim**-0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if mask is not None:
-                attn = attn + mask
-            attn = F.dropout(
-                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+            dropout_p = self.dropout_p if self.training else 0.0
+            use_causal = mask is not None and q.size(-2) == k.size(-2)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None if use_causal else mask,
+                dropout_p=dropout_p,
+                is_causal=use_causal,
             )
-            out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.wo(out)
@@ -447,12 +450,16 @@ class MLAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        use_causal = mask is not None and q.size(-2) == k.size(-2)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None if use_causal else mask,
+            dropout_p=dropout_p,
+            is_causal=use_causal,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
