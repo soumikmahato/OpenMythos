@@ -50,7 +50,8 @@ python training/prepare_metaterid_tokenizer_corpus.py \
   --output-dir data/tokenizer_corpus \
   --total-docs 500000 \
   --shards 32 \
-  --max-chars 32768
+  --max-chars 32768 \
+  --hard-exit
 ```
 
 The default corpus mix uses FineWeb-Edu, OpenWebMath, CodeParrot clean code,

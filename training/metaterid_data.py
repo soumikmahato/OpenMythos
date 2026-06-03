@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -695,6 +696,103 @@ def iter_source_text(source: DataSource, rank: int, world_size: int) -> Iterator
             yield from iter_source_text(source.fallback, rank, world_size)
 
     return _with_fallback()
+
+
+@dataclass(frozen=True)
+class MMapShard:
+    path: Path
+    dtype: str
+    record_len: int
+    records: int
+    weight: float = 1.0
+
+
+def _load_mmap_manifest(mmap_dir: str | Path) -> list[MMapShard]:
+    root = Path(mmap_dir)
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing mmap manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shards: list[MMapShard] = []
+    for row in manifest.get("shards", []):
+        path = Path(row["path"])
+        if not path.is_absolute():
+            path = root / path
+        records = int(row["records"])
+        if records <= 0:
+            continue
+        shards.append(
+            MMapShard(
+                path=path,
+                dtype=str(row["dtype"]),
+                record_len=int(row["record_len"]),
+                records=records,
+                weight=float(row.get("weight", 1.0)),
+            )
+        )
+    if not shards:
+        raise ValueError(f"No usable mmap shards found in {manifest_path}")
+    return shards
+
+
+class MMapTokenDataset(IterableDataset):
+    """
+    Pre-tokenized fixed-record dataset backed by mmap shards.
+
+    Each record is exactly seq_len + 1 token ids. Iteration returns next-token
+    pairs without tokenizer calls, which keeps H100 training off the Python text
+    formatting/tokenization path.
+    """
+
+    def __init__(
+        self,
+        mmap_dir: str | Path,
+        seq_len: int,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 1337,
+    ):
+        self.seq_len = seq_len
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.shards = _load_mmap_manifest(mmap_dir)
+        for shard in self.shards:
+            if shard.record_len != seq_len + 1:
+                raise ValueError(
+                    f"Shard {shard.path} record_len={shard.record_len}; expected {seq_len + 1}"
+                )
+
+    def __iter__(self):
+        worker = get_worker_info()
+        worker_id = worker.id if worker else 0
+        num_workers = worker.num_workers if worker else 1
+        total_workers = self.world_size * num_workers
+        global_worker = self.rank * num_workers + worker_id
+        rng = random.Random(self.seed + 9973 * global_worker)
+        weights = [shard.weight for shard in self.shards]
+        arrays = [
+            np.memmap(
+                shard.path,
+                mode="r",
+                dtype=np.dtype(shard.dtype),
+                shape=(shard.records, shard.record_len),
+            )
+            for shard in self.shards
+        ]
+        cursors = [global_worker % shard.records for shard in self.shards]
+
+        while True:
+            shard_idx = rng.choices(range(len(self.shards)), weights=weights, k=1)[0]
+            shard = self.shards[shard_idx]
+            record_idx = cursors[shard_idx]
+            cursors[shard_idx] = (record_idx + total_workers) % shard.records
+            row = np.asarray(arrays[shard_idx][record_idx], dtype=np.int64)
+            yield (
+                torch.from_numpy(row[:-1].copy()),
+                torch.from_numpy(row[1:].copy()),
+            )
 
 
 class MixedTokenDataset(IterableDataset):

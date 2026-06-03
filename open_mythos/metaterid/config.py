@@ -26,3 +26,15 @@ class MetaTeridConfig(MythosConfig):
     target_active_moe_params: int = 151_000_000
     train_min_loops: int = 2
     train_max_loops: int = 8
+    moe_impl: str = "packed"
+    moe_backend: str = "auto"
+    moe_dispatcher: str = "local_packed"
+    router_score_function: str = "sigmoid"
+    normalize_topk: bool = True
+    enable_router_bias: bool = True
+    router_bias_update_rate: float = 1e-3
+    route_scale: float = 1.0
+    seq_aux_loss_coeff: float = 1e-4
+    moe_pad_for_cuda_graphs: bool = False
+    moe_graph_capacity_factor: float = 1.25
+    moe_static_expert_capacity: int = 0

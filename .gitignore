@@ -2,6 +2,8 @@ __pycache__/
 .venv/
 
 .env
+modal_scripts/
+modal_runs/
 
 image/
 audio/

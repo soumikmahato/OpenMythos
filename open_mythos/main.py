@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -69,6 +70,18 @@ class MythosConfig:
     n_shared_experts: int = 2
     n_experts_per_tok: int = 4  # top-K routed
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
+    moe_impl: str = "legacy"  # "legacy" | "packed"
+    moe_backend: str = "auto"  # "auto" | "padded" | "sorted"
+    moe_dispatcher: str = "local_packed"
+    router_score_function: str = "softmax"  # "softmax" | "sigmoid"
+    normalize_topk: bool = True
+    enable_router_bias: bool = True
+    router_bias_update_rate: float = 1e-3
+    route_scale: float = 1.0
+    seq_aux_loss_coeff: float = 0.0
+    moe_pad_for_cuda_graphs: bool = False
+    moe_graph_capacity_factor: float = 1.25
+    moe_static_expert_capacity: int = 0
     # ACT halting
     act_threshold: float = 0.99
     # RoPE
@@ -453,69 +466,328 @@ class Expert(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-class MoEFFN(nn.Module):
+class MetaTeridMoERouter(nn.Module):
     """
-    Fine-grained Mixture-of-Experts FFN (DeepSeekMoE, Dai et al., 2024).
+    DeepSeek-V3-style top-k router for the packed MetaTerid MoE path.
 
-    Two classes of experts:
-    - Routed experts: n_experts small FFNs; each token activates top-K of them
-      via a learned router. A per-expert bias on router logits is updated during
-      training to keep load balanced across experts without distorting the loss.
-    - Shared experts: n_shared_experts larger FFNs always activated for every token,
-      absorbing common cross-domain patterns (syntax, basic reasoning) that would
-      otherwise be redundantly learned by many routed experts.
+    The optional expert bias affects only the routing decision. Gate weights are
+    gathered from unbiased scores, preserving the aux-loss-free balancing shape.
+    """
 
-    Total activated parameters per token ≈ topk/n_experts of routed + all shared,
-    keeping compute sparse while the total parameter count stays large.
+    def __init__(
+        self,
+        dim: int,
+        n_experts: int,
+        topk: int,
+        *,
+        score_function: str = "sigmoid",
+        normalize_topk: bool = True,
+        route_scale: float = 1.0,
+        enable_router_bias: bool = True,
+        seq_aux_loss_coeff: float = 0.0,
+        router_bias_update_rate: float = 1e-3,
+    ):
+        super().__init__()
+        if score_function not in {"softmax", "sigmoid"}:
+            raise ValueError("router_score_function must be 'softmax' or 'sigmoid'")
+        self.n_experts = n_experts
+        self.topk = topk
+        self.score_function = score_function
+        self.normalize_topk = normalize_topk
+        self.route_scale = route_scale
+        self.enable_router_bias = enable_router_bias
+        self.seq_aux_loss_coeff = seq_aux_loss_coeff
+        self.router_bias_update_rate = router_bias_update_rate
+        self.weight = nn.Parameter(torch.empty(n_experts, dim))
+        nn.init.normal_(self.weight, std=0.02)
+        self.register_buffer("router_bias", torch.zeros(n_experts))
+        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_metrics: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        batch_size: Optional[int] = None,
+        seq_len: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        logits = F.linear(x.float(), self.weight.float())
+        if self.score_function == "softmax":
+            scores = logits.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = logits.sigmoid().to(torch.float32)
+
+        routing_scores = scores
+        if self.enable_router_bias:
+            routing_scores = routing_scores + self.router_bias.float()
+
+        _, topk_idx = routing_scores.topk(self.topk, dim=-1)
+        topk_weight = scores.gather(-1, topk_idx)
+        if self.normalize_topk:
+            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True).clamp(
+                min=1e-9
+            )
+        topk_weight = (topk_weight * self.route_scale).to(x.dtype)
+
+        aux_loss = None
+        if self.training and self.seq_aux_loss_coeff > 0.0:
+            aux_loss = self._sequence_aux_loss(scores, topk_idx, batch_size, seq_len)
+        self.last_aux_loss = aux_loss
+        self._record_metrics(scores, topk_idx)
+        return topk_weight, topk_idx, aux_loss
+
+    def _sequence_aux_loss(
+        self,
+        scores: torch.Tensor,
+        topk_idx: torch.Tensor,
+        batch_size: Optional[int],
+        seq_len: Optional[int],
+    ) -> torch.Tensor:
+        if batch_size is None or seq_len is None or batch_size * seq_len != scores.size(0):
+            selected = F.one_hot(topk_idx, self.n_experts).float().mean(dim=(0, 1))
+            prob = scores.mean(dim=0)
+            return self.seq_aux_loss_coeff * self.n_experts * (selected * prob).sum()
+
+        selected = F.one_hot(topk_idx, self.n_experts).float().mean(dim=1)
+        selected = selected.view(batch_size, seq_len, self.n_experts).mean(dim=1)
+        prob = scores.view(batch_size, seq_len, self.n_experts).mean(dim=1)
+        return (
+            self.seq_aux_loss_coeff
+            * self.n_experts
+            * (selected * prob).sum(dim=1).mean()
+        )
+
+    def _record_metrics(self, scores: torch.Tensor, topk_idx: torch.Tensor) -> None:
+        with torch.no_grad():
+            counts = torch.bincount(topk_idx.reshape(-1), minlength=self.n_experts)
+            probs = scores.mean(dim=0)
+            probs = probs / probs.sum().clamp(min=1e-9)
+            entropy = -(probs * probs.clamp(min=1e-9).log()).sum()
+            self.last_metrics = {
+                "tokens_per_expert": counts.detach(),
+                "router_entropy": entropy.detach(),
+                "expert_load_max": counts.max().detach(),
+                "expert_load_mean": counts.float().mean().detach(),
+            }
+
+    @torch.no_grad()
+    def update_router_bias(self, counts: Optional[torch.Tensor] = None) -> None:
+        if not self.enable_router_bias or not self.last_metrics:
+            return
+        if counts is None:
+            counts = self.last_metrics["tokens_per_expert"].float()
+        else:
+            counts = counts.float()
+        if counts.numel() == 0 or counts.sum() <= 0:
+            return
+        target = counts.mean()
+        direction = torch.sign(target - counts).to(self.router_bias.device)
+        self.router_bias.add_(self.router_bias_update_rate * direction)
+
+
+class MetaTeridMoEDispatcher(nn.Module):
+    """
+    Local packed dispatcher: route -> permute by expert -> grouped experts ->
+    unpermute/combine. The padded backend uses batched GEMMs across experts.
     """
 
     def __init__(self, cfg: MythosConfig):
-        """
-        Args:
-            cfg -- MythosConfig; uses n_experts, n_shared_experts, n_experts_per_tok,
-                   dim, expert_dim
-        """
+        super().__init__()
+        self.n_experts = cfg.n_experts
+        self.topk = cfg.n_experts_per_tok
+        self.dim = cfg.dim
+        self.backend = cfg.moe_backend
+        self.pad_for_cuda_graphs = cfg.moe_pad_for_cuda_graphs
+        self.capacity_factor = cfg.moe_graph_capacity_factor
+        self.static_expert_capacity = cfg.moe_static_expert_capacity
+        self.last_metrics: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weight: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        n_tokens, dim = x.shape
+        flat_expert = topk_idx.reshape(-1)
+        flat_weight = topk_weight.reshape(-1)
+        token_idx = torch.arange(n_tokens, device=x.device).repeat_interleave(self.topk)
+
+        order = flat_expert.argsort(stable=True)
+        sorted_expert = flat_expert[order]
+        sorted_token = token_idx[order]
+        sorted_weight = flat_weight[order]
+        sorted_x = x.index_select(0, sorted_token)
+        counts = torch.bincount(sorted_expert, minlength=self.n_experts)
+
+        backend = "padded" if self.backend == "auto" else self.backend
+        if backend == "padded":
+            sorted_out = self._padded_grouped(
+                sorted_x, sorted_expert, counts, gate_weight, up_weight, down_weight
+            )
+        elif backend == "sorted":
+            sorted_out = self._sorted_loop(
+                sorted_x, counts, gate_weight, up_weight, down_weight
+            )
+        else:
+            raise ValueError(f"Unsupported MoE backend: {self.backend}")
+
+        sorted_out = sorted_out * sorted_weight.unsqueeze(-1)
+        out = x.new_zeros(n_tokens, dim)
+        out.index_add_(0, sorted_token, sorted_out)
+        with torch.no_grad():
+            self.last_metrics = {
+                "tokens_per_expert": counts.detach(),
+                "expert_load_max": counts.max().detach(),
+                "expert_load_mean": counts.float().mean().detach(),
+            }
+        return out
+
+    def _padded_grouped(
+        self,
+        sorted_x: torch.Tensor,
+        sorted_expert: torch.Tensor,
+        counts: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        total = sorted_x.size(0)
+        if total == 0:
+            return sorted_x.new_zeros(0, self.dim)
+        if self.static_expert_capacity > 0:
+            max_count = self.static_expert_capacity
+        elif self.pad_for_cuda_graphs:
+            if torch._dynamo.is_compiling():
+                raise RuntimeError(
+                    "Compiled graph-safe MoE padding requires "
+                    "moe_static_expert_capacity > 0. Run a warmup benchmark first "
+                    "and pass --moe-static-expert-capacity."
+                )
+            observed = int(counts.max().item())
+            max_count = math.ceil(observed * self.capacity_factor)
+            max_count = int(((max_count + 15) // 16) * 16)
+        else:
+            max_count = int(counts.max().item())
+        if not torch._dynamo.is_compiling() and int(counts.max().item()) > max_count:
+            raise RuntimeError(
+                "MoE static expert capacity overflow: "
+                f"max_count={int(counts.max().item())} capacity={max_count}. "
+                "Increase --moe-static-expert-capacity or --moe-graph-capacity-factor."
+            )
+        offsets = counts.cumsum(0) - counts
+        positions = torch.arange(total, device=sorted_x.device) - torch.repeat_interleave(
+            offsets, counts
+        )
+        padded = sorted_x.new_zeros(self.n_experts, max_count, self.dim)
+        padded[sorted_expert, positions] = sorted_x
+        gate = torch.bmm(padded, gate_weight.transpose(1, 2))
+        up = torch.bmm(padded, up_weight.transpose(1, 2))
+        hidden = F.silu(gate) * up
+        expert_out = torch.bmm(hidden, down_weight.transpose(1, 2))
+        return expert_out[sorted_expert, positions]
+
+    def _sorted_loop(
+        self,
+        sorted_x: torch.Tensor,
+        counts: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        out = sorted_x.new_empty(sorted_x.shape[0], self.dim)
+        offsets = counts.cumsum(0) - counts
+        active = torch.nonzero(counts > 0, as_tuple=False).flatten()
+        for eid_tensor in active:
+            eid = int(eid_tensor)
+            start = int(offsets[eid])
+            end = start + int(counts[eid])
+            chunk = sorted_x[start:end]
+            hidden = F.silu(F.linear(chunk, gate_weight[eid])) * F.linear(
+                chunk, up_weight[eid]
+            )
+            out[start:end] = F.linear(hidden, down_weight[eid])
+        zero_use = (gate_weight.sum() + up_weight.sum() + down_weight.sum()) * 0.0
+        return out + zero_use
+
+
+class MoEFFN(nn.Module):
+    """
+    Fine-grained MoE FFN. The legacy implementation preserves the original
+    Python dispatch path; the packed implementation uses a separated router and
+    Megatron-style local token dispatcher for MetaTerid H100 training.
+    """
+
+    def __init__(self, cfg: MythosConfig):
         super().__init__()
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
+        self.impl = getattr(cfg, "moe_impl", "legacy")
+        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_metrics: dict[str, torch.Tensor] = {}
 
-        self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
-        self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        if self.impl == "legacy":
+            self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
+            self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+            self.routed_experts = nn.ModuleList(
+                [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
+            )
+            self.shared_experts = nn.ModuleList(
+                [
+                    Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
+                    for _ in range(self.n_shared)
+                ]
+            )
+        elif self.impl == "packed":
+            self.router = MetaTeridMoERouter(
+                cfg.dim,
+                cfg.n_experts,
+                cfg.n_experts_per_tok,
+                score_function=getattr(cfg, "router_score_function", "sigmoid"),
+                normalize_topk=getattr(cfg, "normalize_topk", True),
+                route_scale=getattr(cfg, "route_scale", 1.0),
+                enable_router_bias=getattr(cfg, "enable_router_bias", True),
+                seq_aux_loss_coeff=getattr(cfg, "seq_aux_loss_coeff", 0.0),
+                router_bias_update_rate=getattr(cfg, "router_bias_update_rate", 1e-3),
+            )
+            self.dispatcher = MetaTeridMoEDispatcher(cfg)
+            self.routed_gate_weight = nn.Parameter(
+                torch.empty(cfg.n_experts, cfg.expert_dim, cfg.dim)
+            )
+            self.routed_up_weight = nn.Parameter(
+                torch.empty(cfg.n_experts, cfg.expert_dim, cfg.dim)
+            )
+            self.routed_down_weight = nn.Parameter(
+                torch.empty(cfg.n_experts, cfg.dim, cfg.expert_dim)
+            )
+            for param in (
+                self.routed_gate_weight,
+                self.routed_up_weight,
+                self.routed_down_weight,
+            ):
+                nn.init.normal_(param, std=0.02)
+            shared_hidden = cfg.n_shared_experts * cfg.n_experts_per_tok * cfg.expert_dim
+            self.shared_gate = nn.Linear(cfg.dim, shared_hidden, bias=False)
+            self.shared_up = nn.Linear(cfg.dim, shared_hidden, bias=False)
+            self.shared_down = nn.Linear(shared_hidden, cfg.dim, bias=False)
+        else:
+            raise ValueError("moe_impl must be 'legacy' or 'packed'")
 
-        self.routed_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
-        )
-        self.shared_experts = nn.ModuleList(
-            [
-                Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
-                for _ in range(self.n_shared)
-            ]
-        )
+    @torch.no_grad()
+    def update_router_bias(self, counts: Optional[torch.Tensor] = None) -> None:
+        if self.impl == "packed":
+            self.router.update_router_bias(counts)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x -- input of shape (B, T, dim)
-        Returns:
-            Tensor of shape (B, T, dim); shared expert outputs are summed on top
-            of the weighted routed expert outputs
-        """
-        B, T, D = x.shape
-        flat = x.view(B * T, D)
-
-        # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
-        # selection of which experts fire so underused experts are picked more,
-        # but the gating weights come from unbiased softmax scores so the bias
-        # never shows up in the gradient.
-        logits = self.router(flat)  # (B*T, n_experts), unbiased
+    def _forward_legacy(self, flat: torch.Tensor) -> torch.Tensor:
+        logits = self.router(flat)
         scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
-        # routed expert dispatch (token-level scatter)
         out = torch.zeros_like(flat)
         for i in range(self.topk):
             expert_ids = topk_idx[:, i]
@@ -526,10 +798,100 @@ class MoEFFN(nn.Module):
                     continue
                 out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
 
-        # shared experts always fire for every token
         for shared in self.shared_experts:
             out = out + shared(flat)
+        return out
 
+    def _forward_packed(self, flat: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+        topk_scores, topk_idx, aux_loss = self.router(flat, batch_size, seq_len)
+        routed = self.dispatcher(
+            flat,
+            topk_idx,
+            topk_scores,
+            self.routed_gate_weight,
+            self.routed_up_weight,
+            self.routed_down_weight,
+        )
+        shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
+        self.last_aux_loss = aux_loss
+        self.last_metrics = {
+            **self.router.last_metrics,
+            **{f"dispatcher_{k}": v for k, v in self.dispatcher.last_metrics.items()},
+        }
+        return routed + shared
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        if self.impl == "packed":
+            old_bias_key = prefix + "router_bias"
+            new_bias_key = prefix + "router.router_bias"
+            if old_bias_key in state_dict and new_bias_key not in state_dict:
+                state_dict[new_bias_key] = state_dict[old_bias_key]
+                state_dict.pop(old_bias_key, None)
+
+        if self.impl == "packed" and prefix + "routed_gate_weight" not in state_dict:
+            routed_gate, routed_up, routed_down = [], [], []
+            for eid in range(self.n_experts):
+                gate_key = prefix + f"routed_experts.{eid}.gate.weight"
+                up_key = prefix + f"routed_experts.{eid}.up.weight"
+                down_key = prefix + f"routed_experts.{eid}.down.weight"
+                if gate_key not in state_dict:
+                    break
+                routed_gate.append(state_dict[gate_key])
+                routed_up.append(state_dict[up_key])
+                routed_down.append(state_dict[down_key])
+            if len(routed_gate) == self.n_experts:
+                state_dict[prefix + "routed_gate_weight"] = torch.stack(routed_gate, 0)
+                state_dict[prefix + "routed_up_weight"] = torch.stack(routed_up, 0)
+                state_dict[prefix + "routed_down_weight"] = torch.stack(routed_down, 0)
+                for eid in range(self.n_experts):
+                    for name in ("gate", "up", "down"):
+                        state_dict.pop(prefix + f"routed_experts.{eid}.{name}.weight", None)
+
+        if self.impl == "packed" and prefix + "shared_gate.weight" not in state_dict:
+            shared_gate, shared_up, shared_down = [], [], []
+            for sid in range(self.n_shared):
+                gate_key = prefix + f"shared_experts.{sid}.gate.weight"
+                up_key = prefix + f"shared_experts.{sid}.up.weight"
+                down_key = prefix + f"shared_experts.{sid}.down.weight"
+                if gate_key not in state_dict:
+                    break
+                shared_gate.append(state_dict[gate_key])
+                shared_up.append(state_dict[up_key])
+                shared_down.append(state_dict[down_key])
+            if len(shared_gate) == self.n_shared:
+                state_dict[prefix + "shared_gate.weight"] = torch.cat(shared_gate, dim=0)
+                state_dict[prefix + "shared_up.weight"] = torch.cat(shared_up, dim=0)
+                state_dict[prefix + "shared_down.weight"] = torch.cat(shared_down, dim=1)
+                for sid in range(self.n_shared):
+                    for name in ("gate", "up", "down"):
+                        state_dict.pop(prefix + f"shared_experts.{sid}.{name}.weight", None)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        flat = x.view(B * T, D)
+        if self.impl == "legacy":
+            out = self._forward_legacy(flat)
+        else:
+            out = self._forward_packed(flat, B, T)
         return out.view(B, T, D)
 
 
