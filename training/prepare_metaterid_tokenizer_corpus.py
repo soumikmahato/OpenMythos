@@ -215,8 +215,10 @@ DEFAULT_SOURCES = [
 ]
 
 SEPARATOR_LINE_RE = re.compile(r"^\s*[\*\|/#\\]*(?:[-_=*#~]{12,})[\*\|/#\\\s]*$")
+MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\s*:?-{3,}:?\s*\|?\s*$")
 LONG_REPEAT_RE = re.compile(r"([ \t\-_=*#~])\1{15,}")
 PUNCT_ONLY_RE = re.compile(r"^[\W_]+$", re.ASCII)
+UNICODE_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+")
 MATH_OR_CODE_HINT_RE = re.compile(
     r"(\\begin|\\frac|\\sum|\\mathbb|```|def |class |SELECT |<html|</|#include|"
     r"function\s+\w+|=>|<\|tool_call\|>|<\|fim_|[$][^$]+[$])"
@@ -316,6 +318,10 @@ def _bounded_text(text: str, rng: random.Random, max_chars: int) -> str:
 def _clean_candidate_text(text: str) -> tuple[str, Counter]:
     reasons: Counter = Counter()
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    unicode_spaces = len(UNICODE_SPACE_RE.findall(text))
+    if unicode_spaces:
+        reasons["unicode_space_runs_normalized"] = unicode_spaces
+        text = UNICODE_SPACE_RE.sub(" ", text)
     cleaned_lines: list[str] = []
     separator_lines = 0
     blank_run = 0
@@ -331,7 +337,7 @@ def _clean_candidate_text(text: str) -> tuple[str, Counter]:
             continue
 
         blank_run = 0
-        if SEPARATOR_LINE_RE.match(line):
+        if SEPARATOR_LINE_RE.match(line) or MARKDOWN_TABLE_SEPARATOR_RE.match(line):
             separator_lines += 1
             continue
 
