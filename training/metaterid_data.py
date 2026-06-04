@@ -27,10 +27,14 @@ class DataSource:
     fallback: "DataSource | None" = None
 
 
-SEPARATOR_LINE_RE = re.compile(r"^\s*[\*\|/#\\]*(?:[-_=*#~]{12,})[\*\|/#\\\s]*$")
+SEPARATOR_LINE_RE = re.compile(r"^\s*[\*&\|/#\\]*(?:[-_=*#~]{12,})[\*&\|/#\\\s]*$")
 MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\s*:?-{3,}:?\s*\|?\s*$")
-LONG_REPEAT_RE = re.compile(r"([ \t\-_=*#~])\1{15,}")
+LONG_REPEAT_RE = re.compile(r"([\-_=*#~])\1{15,}")
+LONG_INLINE_SPACE_RE = re.compile(r"(?<=\S)[ \t]{17,}(?=\S)")
 UNICODE_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+")
+STARCODER_METADATA_PREFIX_RE = re.compile(
+    r"^(?:(?:<reponame>|<filename>|<gh_stars>)[^\n<]*)+\n?"
+)
 LATIN_RE = re.compile(r"[A-Za-z]")
 NON_LATIN_RE = re.compile(r"[^\W\d_A-Za-z]", re.UNICODE)
 COMMENTISH_RE = re.compile(r"^\s*(?:#|//|/\*|\*|\*/|;|--|%|REM\b|\*&)")
@@ -62,7 +66,7 @@ def _strip_leading_polluting_header(lines: list[str]) -> list[str]:
         commentish += int(is_commentish)
         separators += int(is_separator)
         keyword_hit = keyword_hit or bool(HEADER_KEYWORD_RE.search(line))
-    if end >= 4 and (keyword_hit or separators >= 2) and commentish >= max(2, end // 2):
+    if end >= 3 and (keyword_hit or separators >= 2) and commentish >= max(2, end // 2):
         return lines[end:]
     return lines
 
@@ -75,6 +79,7 @@ def clean_training_text(text: str) -> str:
     becoming overrepresented in mmap shards or online streaming batches.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = STARCODER_METADATA_PREFIX_RE.sub("", text)
     text = UNICODE_SPACE_RE.sub(" ", text)
     latin = len(LATIN_RE.findall(text))
     non_latin = len(NON_LATIN_RE.findall(text))
@@ -93,7 +98,7 @@ def clean_training_text(text: str) -> str:
         if SEPARATOR_LINE_RE.match(line) or MARKDOWN_TABLE_SEPARATOR_RE.match(line):
             continue
         line = LONG_REPEAT_RE.sub(lambda match: match.group(1) * 4, line)
-        line = re.sub(r"[ \t]{5,}", "    ", line)
+        line = LONG_INLINE_SPACE_RE.sub("    ", line)
         cleaned_lines.append(line.rstrip())
     return "\n".join(cleaned_lines).strip()
 
@@ -110,6 +115,7 @@ METATERID_T4_PILOT_MIX = [
         name="small_starcoder_code",
         weight=0.10,
         dataset="bigcode/starcoderdata",
+        data_dir="python",
         split="train",
         text_field="content",
         fallback=DataSource(
@@ -593,13 +599,32 @@ METATERID_MAIN_LOCAL_CURATED_MIX = [
 ]
 
 
+THE_STACK_PYTHON_FALLBACK = DataSource(
+    name="the_stack_python_fallback",
+    weight=1.0,
+    dataset="bigcode/the-stack",
+    data_dir="data/python",
+    split="train",
+    text_field="content",
+)
+
+
+THE_STACK_JAVASCRIPT_FALLBACK = DataSource(
+    name="the_stack_javascript_fallback",
+    weight=1.0,
+    dataset="bigcode/the-stack",
+    data_dir="data/javascript",
+    split="train",
+    text_field="content",
+)
+
+
 # The Stack v2 train-smol release is the preferred long-term code source, but
 # its public HF training split stores Software Heritage/provenance ids rather
-# than direct file content. StarCoderData and Stack-smol are gated separately
-# and were not accessible with the current HF token during the 2026-06-04 audit.
-# Immediate production uses selected accessible The Stack language slices and
-# the shared artifact cleaner; avoid ABAP and other header-heavy enterprise
-# languages unless we add stronger language-specific cleaning.
+# than direct file content. Current production uses StarCoderData language
+# slices now that access is enabled; StarCoderData has leading metadata tags
+# such as <reponame>, <filename>, and <gh_stars>, stripped by clean_training_text.
+# Selected The Stack language slices remain as practical fallbacks.
 
 
 METATERID_BASE_FIRST_V1_MIX = [
@@ -618,28 +643,22 @@ METATERID_BASE_FIRST_V1_MIX = [
         text_field="text",
     ),
     DataSource(
-        name="the_stack_python",
-        weight=0.13,
-        dataset="bigcode/the-stack",
-        data_dir="data/python",
+        name="starcoderdata_python",
+        weight=0.14,
+        dataset="bigcode/starcoderdata",
+        data_dir="python",
         split="train",
         text_field="content",
+        fallback=THE_STACK_PYTHON_FALLBACK,
     ),
     DataSource(
-        name="the_stack_javascript",
+        name="starcoderdata_javascript",
         weight=0.04,
-        dataset="bigcode/the-stack",
-        data_dir="data/javascript",
+        dataset="bigcode/starcoderdata",
+        data_dir="javascript",
         split="train",
         text_field="content",
-    ),
-    DataSource(
-        name="the_stack_markdown",
-        weight=0.01,
-        dataset="bigcode/the-stack",
-        data_dir="data/markdown",
-        split="train",
-        text_field="content",
+        fallback=THE_STACK_JAVASCRIPT_FALLBACK,
     ),
     DataSource(
         name="math_stem_openwebmath",
@@ -722,28 +741,22 @@ METATERID_BASE_MIDDLE_V1_MIX = [
         text_field="text",
     ),
     DataSource(
-        name="the_stack_python",
-        weight=0.12,
-        dataset="bigcode/the-stack",
-        data_dir="data/python",
+        name="starcoderdata_python",
+        weight=0.13,
+        dataset="bigcode/starcoderdata",
+        data_dir="python",
         split="train",
         text_field="content",
+        fallback=THE_STACK_PYTHON_FALLBACK,
     ),
     DataSource(
-        name="the_stack_javascript",
+        name="starcoderdata_javascript",
         weight=0.05,
-        dataset="bigcode/the-stack",
-        data_dir="data/javascript",
+        dataset="bigcode/starcoderdata",
+        data_dir="javascript",
         split="train",
         text_field="content",
-    ),
-    DataSource(
-        name="the_stack_markdown",
-        weight=0.01,
-        dataset="bigcode/the-stack",
-        data_dir="data/markdown",
-        split="train",
-        text_field="content",
+        fallback=THE_STACK_JAVASCRIPT_FALLBACK,
     ),
     DataSource(
         name="math_stem_openwebmath",
@@ -834,28 +847,22 @@ METATERID_BASE_FINAL_V1_MIX = [
         text_field="text",
     ),
     DataSource(
-        name="the_stack_python",
-        weight=0.13,
-        dataset="bigcode/the-stack",
-        data_dir="data/python",
+        name="starcoderdata_python",
+        weight=0.14,
+        dataset="bigcode/starcoderdata",
+        data_dir="python",
         split="train",
         text_field="content",
+        fallback=THE_STACK_PYTHON_FALLBACK,
     ),
     DataSource(
-        name="the_stack_javascript",
+        name="starcoderdata_javascript",
         weight=0.06,
-        dataset="bigcode/the-stack",
-        data_dir="data/javascript",
+        dataset="bigcode/starcoderdata",
+        data_dir="javascript",
         split="train",
         text_field="content",
-    ),
-    DataSource(
-        name="the_stack_markdown",
-        weight=0.01,
-        dataset="bigcode/the-stack",
-        data_dir="data/markdown",
-        split="train",
-        text_field="content",
+        fallback=THE_STACK_JAVASCRIPT_FALLBACK,
     ),
     DataSource(
         name="math_stem_openwebmath",

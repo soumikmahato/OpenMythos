@@ -39,8 +39,12 @@ MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"(?m)^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\
 LONG_SPACE_RE = re.compile(r"[ \t]{8,}")
 UNICODE_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
 REPEATED_PUNCT_RE = re.compile(r"([-_=*#~])\1{15,}")
-SEPARATOR_LINE_RE = re.compile(r"^\s*[\*\|/#\\]*(?:[-_=*#~]{12,})[\*\|/#\\\s]*$")
-LONG_REPEAT_RE = re.compile(r"([ \t\-_=*#~])\1{15,}")
+SEPARATOR_LINE_RE = re.compile(r"^\s*[\*&\|/#\\]*(?:[-_=*#~]{12,})[\*&\|/#\\\s]*$")
+LONG_REPEAT_RE = re.compile(r"([\-_=*#~])\1{15,}")
+LONG_INLINE_SPACE_RE = re.compile(r"(?<=\S)[ \t]{17,}(?=\S)")
+STARCODER_METADATA_PREFIX_RE = re.compile(
+    r"^(?:(?:<reponame>|<filename>|<gh_stars>)[^\n<]*)+\n?"
+)
 LATIN_RE = re.compile(r"[A-Za-z]")
 NON_LATIN_RE = re.compile(r"[^\W\d_A-Za-z]", re.UNICODE)
 COMMENTISH_RE = re.compile(r"^\s*(?:#|//|/\*|\*|\*/|;|--|%|REM\b|\*&)")
@@ -106,8 +110,10 @@ SOURCES = [
         split="no_think",
         formatter="auto",
     ),
-    InspectSource("the_stack_python", "bigcode/the-stack", data_dir="data/python", text_field="content"),
-    InspectSource("the_stack_javascript", "bigcode/the-stack", data_dir="data/javascript", text_field="content"),
+    InspectSource("starcoderdata_python", "bigcode/starcoderdata", data_dir="python", text_field="content"),
+    InspectSource("starcoderdata_javascript", "bigcode/starcoderdata", data_dir="javascript", text_field="content"),
+    InspectSource("the_stack_python_fallback", "bigcode/the-stack", data_dir="data/python", text_field="content"),
+    InspectSource("the_stack_javascript_fallback", "bigcode/the-stack", data_dir="data/javascript", text_field="content"),
     InspectSource("the_stack_markdown", "bigcode/the-stack", data_dir="data/markdown", text_field="content"),
     InspectSource("the_stack_tex", "bigcode/the-stack", data_dir="data/tex", text_field="content"),
     InspectSource("the_stack_sql", "bigcode/the-stack", data_dir="data/sql", text_field="content"),
@@ -167,13 +173,14 @@ def _strip_leading_polluting_header(lines: list[str]) -> list[str]:
         commentish += int(is_commentish)
         separators += int(is_separator)
         keyword_hit = keyword_hit or bool(HEADER_KEYWORD_RE.search(line))
-    if end >= 4 and (keyword_hit or separators >= 2) and commentish >= max(2, end // 2):
+    if end >= 3 and (keyword_hit or separators >= 2) and commentish >= max(2, end // 2):
         return lines[end:]
     return lines
 
 
 def clean_training_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = STARCODER_METADATA_PREFIX_RE.sub("", text)
     text = UNICODE_SPACE_RE.sub(" ", text)
     latin = len(LATIN_RE.findall(text))
     non_latin = len(NON_LATIN_RE.findall(text))
@@ -192,7 +199,7 @@ def clean_training_text(text: str) -> str:
         if SEPARATOR_LINE_RE.match(line) or MARKDOWN_TABLE_SEPARATOR_RE.match(line):
             continue
         line = LONG_REPEAT_RE.sub(lambda match: match.group(1) * 4, line)
-        line = re.sub(r"[ \t]{5,}", "    ", line)
+        line = LONG_INLINE_SPACE_RE.sub("    ", line)
         cleaned_lines.append(line.rstrip())
     return "\n".join(cleaned_lines).strip()
 
@@ -322,6 +329,7 @@ def inspect_source(source: InspectSource, *, head: int, shuffled: int, seed: int
     clean_changed = 0
     text_lengths = []
     empty_text = 0
+    cleaned_empty = 0
     for label, rows, out_key in [
         ("head", head_rows, "head_raw"),
         ("shuffled", shuffled_rows, "shuffled_raw"),
@@ -333,6 +341,8 @@ def inspect_source(source: InspectSource, *, head: int, shuffled: int, seed: int
             text_lengths.append(len(text))
             artifact_counts.update(_artifact_counts(text))
             cleaned = clean_training_text(text)
+            if text.strip() and not cleaned:
+                cleaned_empty += 1
             if cleaned != text.strip():
                 clean_changed += 1
             result[out_key].append(
@@ -349,6 +359,7 @@ def inspect_source(source: InspectSource, *, head: int, shuffled: int, seed: int
     result["sample_summary"] = {
         "sampled_rows": total,
         "empty_text": empty_text,
+        "cleaned_empty": cleaned_empty,
         "text_len_min": min(text_lengths) if text_lengths else 0,
         "text_len_max": max(text_lengths) if text_lengths else 0,
         "text_len_avg": sum(text_lengths) / len(text_lengths) if text_lengths else 0,
