@@ -100,6 +100,101 @@ def _parse_loop_buckets(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
 
 
+def _parse_mix_schedule(value: str, default_mix: str) -> list[tuple[float, str]]:
+    value = value.strip()
+    if not value:
+        return [(1.0, default_mix)]
+    if value in {"base_v1", "main_base_v1", "first_middle_final_v1"}:
+        return [
+            (0.20, "main_base_first_v1"),
+            (0.80, "main_base_middle_v1"),
+            (1.00, "main_base_final_v1"),
+        ]
+
+    schedule: list[tuple[float, str]] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "@" in part:
+            mix_name, end_ratio_s = part.split("@", 1)
+        elif ":" in part:
+            mix_name, end_ratio_s = part.split(":", 1)
+        else:
+            raise ValueError(
+                "--mix-schedule entries must look like mix@0.2,mix@0.8,mix@1.0"
+            )
+        mix_name = mix_name.strip()
+        if mix_name not in MIX_PRESETS:
+            options = ", ".join(sorted(MIX_PRESETS))
+            raise ValueError(f"Unknown mix '{mix_name}' in --mix-schedule. Available: {options}")
+        end_ratio = float(end_ratio_s)
+        if not 0 < end_ratio <= 1:
+            raise ValueError("--mix-schedule end ratios must be in (0, 1]")
+        if schedule and end_ratio <= schedule[-1][0]:
+            raise ValueError("--mix-schedule end ratios must increase")
+        schedule.append((end_ratio, mix_name))
+    if not schedule:
+        raise ValueError("--mix-schedule did not contain any stages")
+    if schedule[-1][0] < 1.0:
+        raise ValueError("--mix-schedule must end at ratio 1.0")
+    return schedule
+
+
+def _mix_for_tokens(tokens_seen: int, target_tokens: int, schedule: list[tuple[float, str]]) -> str:
+    progress = 1.0 if target_tokens <= 0 else min(1.0, max(0.0, tokens_seen / target_tokens))
+    for end_ratio, mix_name in schedule:
+        if progress < end_ratio:
+            return mix_name
+    return schedule[-1][1]
+
+
+def _resolve_mmap_dir(root: str | Path, mix_name: str) -> Path:
+    root_path = Path(root)
+    stage_path = root_path / mix_name
+    if (stage_path / "manifest.json").exists():
+        return stage_path
+    return root_path
+
+
+def _build_loader(
+    *,
+    args: argparse.Namespace,
+    tokenizer: MetaTeridTokenizer,
+    rank: int,
+    world_size: int,
+    device: str,
+    mix_name: str,
+) -> DataLoader:
+    if args.data_backend == "mmap":
+        if not args.mmap_dir:
+            raise ValueError("--mmap-dir is required when --data-backend=mmap")
+        dataset = MMapTokenDataset(
+            _resolve_mmap_dir(args.mmap_dir, mix_name),
+            args.seq_len,
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed,
+        )
+    else:
+        dataset = MixedTokenDataset(
+            tokenizer,
+            args.seq_len,
+            get_mix_sources(mix_name),
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed,
+            max_sample_chars=args.max_sample_chars,
+        )
+    return DataLoader(
+        dataset,
+        batch_size=args.micro_batch,
+        num_workers=args.num_workers,
+        pin_memory=("cuda" in device),
+        persistent_workers=args.num_workers > 0,
+    )
+
+
 def _collect_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor | None:
     losses = []
     for module in model.modules():
@@ -569,6 +664,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-dir", default="checkpoints/metaterid_main")
     parser.add_argument("--variant", default="metaterid_1b", choices=["metaterid_1b", "t4_pilot"])
     parser.add_argument("--mix", default="final", choices=sorted(MIX_PRESETS))
+    parser.add_argument(
+        "--mix-schedule",
+        default="",
+        help=(
+            "Optional staged curriculum. Use 'base_v1' for "
+            "main_base_first_v1@0.2,main_base_middle_v1@0.8,main_base_final_v1@1.0, "
+            "or pass explicit entries like mix@0.2,mix@0.8,mix@1.0. "
+            "For mmap, --mmap-dir may contain subdirectories named after each mix."
+        ),
+    )
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--target-tokens", type=int, default=100_000_000_000)
     parser.add_argument(
@@ -877,32 +982,15 @@ def main() -> None:
         if master:
             logger.info("Captured CUDA train graphs")
 
-    if args.data_backend == "mmap":
-        if not args.mmap_dir:
-            raise ValueError("--mmap-dir is required when --data-backend=mmap")
-        dataset = MMapTokenDataset(
-            args.mmap_dir,
-            args.seq_len,
-            rank=rank,
-            world_size=world_size,
-            seed=args.seed,
-        )
-    else:
-        dataset = MixedTokenDataset(
-            tokenizer,
-            args.seq_len,
-            get_mix_sources(args.mix),
-            rank=rank,
-            world_size=world_size,
-            seed=args.seed,
-            max_sample_chars=args.max_sample_chars,
-        )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.micro_batch,
-        num_workers=args.num_workers,
-        pin_memory=("cuda" in device),
-        persistent_workers=args.num_workers > 0,
+    mix_schedule = _parse_mix_schedule(args.mix_schedule, args.mix)
+    current_mix = _mix_for_tokens(tokens_seen, target_tokens, mix_schedule)
+    loader = _build_loader(
+        args=args,
+        tokenizer=tokenizer,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        mix_name=current_mix,
     )
 
     global_batch_tokens = world_size * args.micro_batch * args.grad_accum * args.seq_len
@@ -918,7 +1006,8 @@ def main() -> None:
 
     if master:
         logger.info(
-            f"variant={args.variant} mix={args.mix} ddp={ddp} world_size={world_size} "
+            f"variant={args.variant} mix={current_mix} mix_schedule={mix_schedule} "
+            f"ddp={ddp} world_size={world_size} "
             f"data_backend={args.data_backend} moe_impl={getattr(cfg, 'moe_impl', 'legacy')} "
             f"moe_backend={getattr(cfg, 'moe_backend', 'auto')} "
             f"seq_len={args.seq_len} micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
@@ -937,6 +1026,23 @@ def main() -> None:
     last_log_step = step
 
     while tokens_seen < target_tokens:
+        next_mix = _mix_for_tokens(tokens_seen, target_tokens, mix_schedule)
+        if next_mix != current_mix:
+            current_mix = next_mix
+            loader = _build_loader(
+                args=args,
+                tokenizer=tokenizer,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                mix_name=current_mix,
+            )
+            data_iter = iter(loader)
+            if master:
+                logger.info(
+                    f"Switched data mix to {current_mix} at {tokens_seen:,} tokens"
+                )
+
         if (
             not switched
             and args.muon_switch_ratio < 1.0

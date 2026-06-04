@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--mix", default="final")
+    parser.add_argument(
+        "--mixes",
+        default="",
+        help=(
+            "Optional comma-separated mixes to build into subdirectories under "
+            "--out-dir, e.g. main_base_first_v1,main_base_middle_v1,main_base_final_v1."
+        ),
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument(
@@ -50,14 +58,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    out_dir = Path(args.out_dir)
+def _build_one(args: argparse.Namespace, tokenizer: MetaTeridTokenizer, mix_name: str, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = MetaTeridTokenizer(args.tokenizer)
     dtype = _dtype_for_vocab(tokenizer.vocab_size)
     record_len = args.seq_len + 1
     manifest = {
+        "mix": mix_name,
         "seq_len": args.seq_len,
         "record_len": record_len,
         "vocab_size": tokenizer.vocab_size,
@@ -65,7 +71,7 @@ def main() -> None:
         "shards": [],
     }
 
-    for source in normalize_weights(get_mix_sources(args.mix)):
+    for source in normalize_weights(get_mix_sources(mix_name)):
         shard_name = f"{_safe_name(source.name)}.bin"
         shard_path = out_dir / shard_name
         records = 0
@@ -101,6 +107,19 @@ def main() -> None:
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"manifest -> {manifest_path}", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    tokenizer = MetaTeridTokenizer(args.tokenizer)
+    mixes = [part.strip() for part in args.mixes.split(",") if part.strip()]
+    if not mixes:
+        _build_one(args, tokenizer, args.mix, Path(args.out_dir))
+        return
+    root = Path(args.out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    for mix_name in mixes:
+        _build_one(args, tokenizer, mix_name, root / mix_name)
 
 
 if __name__ == "__main__":

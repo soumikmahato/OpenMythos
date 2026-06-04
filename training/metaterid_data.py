@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -18,11 +19,83 @@ class DataSource:
     weight: float
     dataset: str | None = None
     config: str | None = None
+    data_dir: str | None = None
     split: str = "train"
     text_field: str = "text"
     local_jsonl: str | None = None
     formatter: str = "auto"
     fallback: "DataSource | None" = None
+
+
+SEPARATOR_LINE_RE = re.compile(r"^\s*[\*\|/#\\]*(?:[-_=*#~]{12,})[\*\|/#\\\s]*$")
+MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\s*:?-{3,}:?\s*\|?\s*$")
+LONG_REPEAT_RE = re.compile(r"([ \t\-_=*#~])\1{15,}")
+UNICODE_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+")
+LATIN_RE = re.compile(r"[A-Za-z]")
+NON_LATIN_RE = re.compile(r"[^\W\d_A-Za-z]", re.UNICODE)
+COMMENTISH_RE = re.compile(r"^\s*(?:#|//|/\*|\*|\*/|;|--|%|REM\b|\*&)")
+HEADER_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:copyright|license|licence|author|created by|generated|auto-generated|"
+    r"report\s+\w+|filter empty values|local interface|importing)\b"
+)
+
+
+def _strip_leading_polluting_header(lines: list[str]) -> list[str]:
+    window = lines[:80]
+    if len(window) < 4:
+        return lines
+    end = 0
+    commentish = 0
+    separators = 0
+    keyword_hit = False
+    for idx, line in enumerate(window):
+        stripped = line.strip()
+        if not stripped:
+            if end:
+                end = idx + 1
+            continue
+        is_separator = bool(SEPARATOR_LINE_RE.match(line) or MARKDOWN_TABLE_SEPARATOR_RE.match(line))
+        is_commentish = bool(COMMENTISH_RE.match(line))
+        if not (is_separator or is_commentish):
+            break
+        end = idx + 1
+        commentish += int(is_commentish)
+        separators += int(is_separator)
+        keyword_hit = keyword_hit or bool(HEADER_KEYWORD_RE.search(line))
+    if end >= 4 and (keyword_hit or separators >= 2) and commentish >= max(2, end // 2):
+        return lines[end:]
+    return lines
+
+
+def clean_training_text(text: str) -> str:
+    """
+    Apply the tokenizer-production artifact filters to training streams.
+
+    This keeps markdown/code separator junk and unicode-space artifacts from
+    becoming overrepresented in mmap shards or online streaming batches.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = UNICODE_SPACE_RE.sub(" ", text)
+    latin = len(LATIN_RE.findall(text))
+    non_latin = len(NON_LATIN_RE.findall(text))
+    if non_latin > 200 and non_latin > latin * 0.5:
+        return ""
+    cleaned_lines: list[str] = []
+    blank_run = 0
+    for line in _strip_leading_polluting_header(text.split("\n")):
+        stripped = line.strip()
+        if not stripped:
+            blank_run += 1
+            if blank_run <= 2:
+                cleaned_lines.append("")
+            continue
+        blank_run = 0
+        if SEPARATOR_LINE_RE.match(line) or MARKDOWN_TABLE_SEPARATOR_RE.match(line):
+            continue
+        line = LONG_REPEAT_RE.sub(lambda match: match.group(1) * 4, line)
+        line = re.sub(r"[ \t]{5,}", "    ", line)
+        cleaned_lines.append(line.rstrip())
+    return "\n".join(cleaned_lines).strip()
 
 
 METATERID_T4_PILOT_MIX = [
@@ -520,6 +593,343 @@ METATERID_MAIN_LOCAL_CURATED_MIX = [
 ]
 
 
+# The Stack v2 train-smol release is the preferred long-term code source, but
+# its public HF training split stores Software Heritage/provenance ids rather
+# than direct file content. StarCoderData and Stack-smol are gated separately
+# and were not accessible with the current HF token during the 2026-06-04 audit.
+# Immediate production uses selected accessible The Stack language slices and
+# the shared artifact cleaner; avoid ABAP and other header-heavy enterprise
+# languages unless we add stronger language-specific cleaning.
+
+
+METATERID_BASE_FIRST_V1_MIX = [
+    DataSource(
+        name="ultrafineweb_en",
+        weight=0.37,
+        dataset="openbmb/Ultra-FineWeb",
+        split="en",
+        text_field="content",
+    ),
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.15,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="the_stack_python",
+        weight=0.13,
+        dataset="bigcode/the-stack",
+        data_dir="data/python",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_javascript",
+        weight=0.04,
+        dataset="bigcode/the-stack",
+        data_dir="data/javascript",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_markdown",
+        weight=0.01,
+        dataset="bigcode/the-stack",
+        data_dir="data/markdown",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.10,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="ultradata_math_l3_textbook",
+        weight=0.05,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-Textbook-Exercise-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_multistyle_en",
+        weight=0.07,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_qa_en",
+        weight=0.04,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_sft_code_no_think",
+        weight=0.010,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Code",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_math_no_think",
+        weight=0.008,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Math",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_if_no_think",
+        weight=0.007,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="IF",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.015,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+]
+
+
+METATERID_BASE_MIDDLE_V1_MIX = [
+    DataSource(
+        name="ultrafineweb_en",
+        weight=0.26,
+        dataset="openbmb/Ultra-FineWeb",
+        split="en",
+        text_field="content",
+    ),
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.10,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="the_stack_python",
+        weight=0.12,
+        dataset="bigcode/the-stack",
+        data_dir="data/python",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_javascript",
+        weight=0.05,
+        dataset="bigcode/the-stack",
+        data_dir="data/javascript",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_markdown",
+        weight=0.01,
+        dataset="bigcode/the-stack",
+        data_dir="data/markdown",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.10,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="ultradata_math_l3_qa",
+        weight=0.06,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_math_l3_textbook",
+        weight=0.04,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-Textbook-Exercise-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_multistyle_en",
+        weight=0.09,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_qa_en",
+        weight=0.08,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_sft_code_no_think",
+        weight=0.025,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Code",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_math_no_think",
+        weight=0.020,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Math",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_if_no_think",
+        weight=0.015,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="IF",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.030,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+]
+
+
+METATERID_BASE_FINAL_V1_MIX = [
+    DataSource(
+        name="ultrafineweb_en",
+        weight=0.18,
+        dataset="openbmb/Ultra-FineWeb",
+        split="en",
+        text_field="content",
+    ),
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.06,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="the_stack_python",
+        weight=0.13,
+        dataset="bigcode/the-stack",
+        data_dir="data/python",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_javascript",
+        weight=0.06,
+        dataset="bigcode/the-stack",
+        data_dir="data/javascript",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="the_stack_markdown",
+        weight=0.01,
+        dataset="bigcode/the-stack",
+        data_dir="data/markdown",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.08,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="ultradata_math_l3_qa",
+        weight=0.08,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_math_l3_textbook",
+        weight=0.04,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-Textbook-Exercise-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_multistyle_en",
+        weight=0.10,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_qa_en",
+        weight=0.12,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_sft_code_no_think",
+        weight=0.040,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Code",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_math_no_think",
+        weight=0.030,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Math",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_if_no_think",
+        weight=0.025,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="IF",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.045,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+]
+
+
 MIX_PRESETS = {
     "pilot": METATERID_T4_PILOT_MIX,
     "kaggle_chunk": METATERID_T4_KAGGLE_CHUNK_MIX,
@@ -534,6 +944,10 @@ MIX_PRESETS = {
     "final": METATERID_MAIN_BASE_V0_MIX,
     "current_mixed": METATERID_MAIN_BASE_V0_MIX,
     "main_base_v0": METATERID_MAIN_BASE_V0_MIX,
+    "main_base_first_v1": METATERID_BASE_FIRST_V1_MIX,
+    "main_base_middle_v1": METATERID_BASE_MIDDLE_V1_MIX,
+    "main_base_final_v1": METATERID_BASE_FINAL_V1_MIX,
+    "main_smoke_50m_v1": METATERID_BASE_FIRST_V1_MIX,
     "main_stable_web": METATERID_MAIN_STABLE_WEB_MIX,
     "main_reasoning_bootstrap": METATERID_MAIN_REASONING_BOOTSTRAP_MIX,
     "main_local_curated": METATERID_MAIN_LOCAL_CURATED_MIX,
@@ -558,6 +972,7 @@ def normalize_weights(sources: list[DataSource]) -> list[DataSource]:
             weight=source.weight / total,
             dataset=source.dataset,
             config=source.config,
+            data_dir=source.data_dir,
             split=source.split,
             text_field=source.text_field,
             local_jsonl=source.local_jsonl,
@@ -637,8 +1052,8 @@ def _iter_local_jsonl(path: Path, source: DataSource) -> Iterator[str]:
                     if not line.strip():
                         continue
                     row = json.loads(line)
-                    text = _format_sample(row, source)
-                    if text.strip():
+                    text = clean_training_text(_format_sample(row, source))
+                    if text:
                         yield text
 
     return _reader()
@@ -654,6 +1069,8 @@ def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[
     }
     if source.config:
         kwargs["name"] = source.config
+    if source.data_dir:
+        kwargs["data_dir"] = source.data_dir
 
     ds = load_dataset(**kwargs)
     total_shards, shard_index = _rank_worker_shard(rank, world_size)
@@ -672,7 +1089,8 @@ def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[
         if manual_shard and row_idx % total_shards != shard_index:
             continue
         text = _format_sample(sample, source)
-        if text.strip():
+        text = clean_training_text(text)
+        if text:
             yield text
 
 
