@@ -328,14 +328,30 @@ def _latest_checkpoint(path: Path, *, prefer_final: bool = False) -> Path | None
         final = path / "final.pt"
         if final.exists():
             return final
-    model_only = path / "model_only.pt"
-    if model_only.exists():
-        return model_only
-    final = path / "final.pt"
-    if final.exists():
-        return final
-    ckpts = sorted(path.glob("tokens_*.pt"))
-    return ckpts[-1] if ckpts else None
+
+    candidates = list(path.glob("tokens_*.pt"))
+    for name in ("latest.pt", "final.pt"):
+        candidate = path / name
+        if candidate.exists():
+            candidates.append(candidate)
+    if not candidates:
+        model_only = path / "model_only.pt"
+        if model_only.exists():
+            candidates.append(model_only)
+    if not candidates:
+        return None
+
+    def checkpoint_order(candidate: Path) -> tuple[int, float]:
+        meta_path = candidate.with_suffix(".json")
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                return int(meta.get("tokens_seen", 0)), candidate.stat().st_mtime
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return 0, candidate.stat().st_mtime
+
+    return max(candidates, key=checkpoint_order)
 
 
 def _load_variant(name: str):

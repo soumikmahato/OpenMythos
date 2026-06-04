@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
+from metaterid_checkpoint import load_metaterid_model
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 
 
@@ -58,23 +58,17 @@ def _trigram_repeat_rate(text: str) -> float:
     return 1.0 - len(set(trigrams)) / len(trigrams)
 
 
-def _load_cfg(checkpoint: dict, tokenizer: MetaTeridTokenizer, seq_len: int | None):
-    cfg = checkpoint.get("cfg")
-    if cfg is None:
-        cfg = metaterid_t4_pilot()
-    cfg.vocab_size = tokenizer.vocab_size
-    if seq_len is not None:
-        cfg.max_seq_len = seq_len
-    return cfg
-
-
 def _load_model(args: argparse.Namespace):
     tokenizer = MetaTeridTokenizer(args.tokenizer)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = _load_cfg(checkpoint, tokenizer, args.seq_len)
-    model = MetaTeridForCausalLM(cfg).to(args.device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+    model, _ = load_metaterid_model(
+        checkpoint_path=args.checkpoint,
+        tokenizer=tokenizer,
+        device=args.device,
+        seq_len=args.seq_len,
+        model_param_dtype=args.model_param_dtype,
+        moe_param_dtype=args.moe_param_dtype,
+        moe_backend=args.moe_backend,
+    )
     return tokenizer, model
 
 
@@ -131,6 +125,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N cases.")
+    parser.add_argument(
+        "--moe-backend",
+        default="checkpoint",
+        choices=("checkpoint", "auto", "grouped_mm", "padded", "sorted"),
+    )
+    parser.add_argument(
+        "--model-param-dtype",
+        default="checkpoint",
+        choices=("checkpoint", "fp32", "bf16", "fp16"),
+    )
+    parser.add_argument(
+        "--moe-param-dtype",
+        default="auto",
+        choices=("auto", "fp32", "bf16", "fp16"),
+    )
     return parser.parse_args()
 
 

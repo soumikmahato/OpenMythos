@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
+from metaterid_checkpoint import load_metaterid_model
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 
 
@@ -57,6 +57,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--moe-backend",
+        default="checkpoint",
+        choices=("checkpoint", "auto", "grouped_mm", "padded", "sorted"),
+        help="MoE backend override. Default keeps the checkpoint config.",
+    )
+    parser.add_argument(
+        "--model-param-dtype",
+        default="checkpoint",
+        choices=("checkpoint", "fp32", "bf16", "fp16"),
+        help="Optional dtype conversion for all model parameters after loading.",
+    )
+    parser.add_argument(
+        "--moe-param-dtype",
+        default="auto",
+        choices=("auto", "fp32", "bf16", "fp16"),
+        help="Packed MoE expert/shared weight dtype. Auto uses BF16 on CUDA grouped-MM.",
+    )
     return parser.parse_args()
 
 
@@ -72,15 +90,15 @@ def main() -> None:
         prompts = [_wrap_chat(prompt) for prompt in prompts]
 
     tokenizer = MetaTeridTokenizer(args.tokenizer)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = checkpoint.get("cfg") or metaterid_t4_pilot()
-    cfg.vocab_size = tokenizer.vocab_size
-    if args.seq_len is not None:
-        cfg.max_seq_len = args.seq_len
-
-    model = MetaTeridForCausalLM(cfg).to(args.device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+    model, _ = load_metaterid_model(
+        checkpoint_path=args.checkpoint,
+        tokenizer=tokenizer,
+        device=args.device,
+        seq_len=args.seq_len,
+        model_param_dtype=args.model_param_dtype,
+        moe_param_dtype=args.moe_param_dtype,
+        moe_backend=args.moe_backend,
+    )
 
     rows = []
     for prompt in prompts:

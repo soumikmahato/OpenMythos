@@ -5,7 +5,7 @@ import argparse
 
 import torch
 
-from open_mythos.metaterid import MetaTeridForCausalLM, metaterid_t4_pilot
+from metaterid_checkpoint import load_metaterid_model
 from open_mythos.metaterid_tokenizer import MetaTeridTokenizer
 
 
@@ -20,6 +20,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--moe-backend",
+        default="checkpoint",
+        choices=("checkpoint", "auto", "grouped_mm", "padded", "sorted"),
+    )
+    parser.add_argument(
+        "--model-param-dtype",
+        default="checkpoint",
+        choices=("checkpoint", "fp32", "bf16", "fp16"),
+    )
+    parser.add_argument(
+        "--moe-param-dtype",
+        default="auto",
+        choices=("auto", "fp32", "bf16", "fp16"),
+    )
     return parser.parse_args()
 
 
@@ -27,14 +42,15 @@ def main() -> None:
     args = parse_args()
     tokenizer = MetaTeridTokenizer(args.tokenizer)
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = checkpoint.get("cfg") or metaterid_t4_pilot()
-    cfg.vocab_size = tokenizer.vocab_size
-    cfg.max_seq_len = args.seq_len
-
-    model = MetaTeridForCausalLM(cfg).to(args.device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+    model, _ = load_metaterid_model(
+        checkpoint_path=args.checkpoint,
+        tokenizer=tokenizer,
+        device=args.device,
+        seq_len=args.seq_len,
+        model_param_dtype=args.model_param_dtype,
+        moe_param_dtype=args.moe_param_dtype,
+        moe_backend=args.moe_backend,
+    )
 
     prompt = args.prompt
     input_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=args.device)
