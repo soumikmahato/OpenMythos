@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import random
 import re
 from dataclasses import dataclass
@@ -1154,12 +1155,18 @@ def _format_sample(sample: dict, source: DataSource) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _iter_local_jsonl(path: Path, source: DataSource) -> Iterator[str]:
+def _iter_local_jsonl(
+    path: Path,
+    source: DataSource,
+    *,
+    repeat: bool = True,
+) -> Iterator[str]:
     if not path.exists():
         return iter(())
 
     def _reader() -> Iterator[str]:
         while True:
+            yielded = False
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     if not line.strip():
@@ -1167,12 +1174,22 @@ def _iter_local_jsonl(path: Path, source: DataSource) -> Iterator[str]:
                     row = json.loads(line)
                     text = clean_training_text(_format_sample(row, source))
                     if text:
+                        yielded = True
                         yield text
+            if not repeat or not yielded:
+                break
 
     return _reader()
 
 
-def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[str]:
+def _iter_hf_stream(
+    source: DataSource,
+    rank: int,
+    world_size: int,
+    *,
+    shuffle_seed: int | None = None,
+    shuffle_buffer_size: int = 10_000,
+) -> Iterator[str]:
     from datasets import load_dataset
 
     kwargs = {
@@ -1186,6 +1203,8 @@ def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[
         kwargs["data_dir"] = source.data_dir
 
     ds = load_dataset(**kwargs)
+    if shuffle_seed is not None:
+        ds = ds.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_size)
     total_shards, shard_index = _rank_worker_shard(rank, world_size)
     manual_shard = False
     try:
@@ -1207,24 +1226,55 @@ def _iter_hf_stream(source: DataSource, rank: int, world_size: int) -> Iterator[
             yield text
 
 
-def iter_source_text(source: DataSource, rank: int, world_size: int) -> Iterator[str]:
+def iter_source_text(
+    source: DataSource,
+    rank: int,
+    world_size: int,
+    *,
+    shuffle_seed: int | None = None,
+    shuffle_buffer_size: int = 10_000,
+    repeat_local: bool = True,
+) -> Iterator[str]:
     if source.local_jsonl is not None:
-        return _iter_local_jsonl(Path(source.local_jsonl), source)
+        return _iter_local_jsonl(
+            Path(source.local_jsonl),
+            source,
+            repeat=repeat_local,
+        )
     if source.dataset is None:
         return iter(())
     if source.fallback is None:
-        return _iter_hf_stream(source, rank, world_size)
+        return _iter_hf_stream(
+            source,
+            rank,
+            world_size,
+            shuffle_seed=shuffle_seed,
+            shuffle_buffer_size=shuffle_buffer_size,
+        )
 
     def _with_fallback() -> Iterator[str]:
         try:
-            yield from _iter_hf_stream(source, rank, world_size)
+            yield from _iter_hf_stream(
+                source,
+                rank,
+                world_size,
+                shuffle_seed=shuffle_seed,
+                shuffle_buffer_size=shuffle_buffer_size,
+            )
         except Exception as exc:
             print(
                 f"[metaterid_data] Source {source.name} failed with {type(exc).__name__}: {exc}. "
                 f"Falling back to {source.fallback.name}.",
                 flush=True,
             )
-            yield from iter_source_text(source.fallback, rank, world_size)
+            yield from iter_source_text(
+                source.fallback,
+                rank,
+                world_size,
+                shuffle_seed=shuffle_seed,
+                shuffle_buffer_size=shuffle_buffer_size,
+                repeat_local=repeat_local,
+            )
 
     return _with_fallback()
 
@@ -1244,6 +1294,12 @@ def _load_mmap_manifest(mmap_dir: str | Path) -> list[MMapShard]:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing mmap manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if int(manifest.get("format_version", 0)) < 2 or manifest.get("document_boundary") != "bos_eos":
+        raise ValueError(
+            f"Outdated mmap corpus at {manifest_path}: expected format_version>=2 "
+            "with document_boundary='bos_eos'. Rebuild it with "
+            "training/build_metaterid_mmap.py before training."
+        )
     shards: list[MMapShard] = []
     for row in manifest.get("shards", []):
         path = Path(row["path"])
@@ -1252,11 +1308,22 @@ def _load_mmap_manifest(mmap_dir: str | Path) -> list[MMapShard]:
         records = int(row["records"])
         if records <= 0:
             continue
+        dtype = str(row["dtype"])
+        record_len = int(row["record_len"])
+        expected_bytes = records * record_len * np.dtype(dtype).itemsize
+        if not path.exists():
+            raise FileNotFoundError(f"Missing mmap shard referenced by manifest: {path}")
+        actual_bytes = path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"Truncated or mismatched mmap shard {path}: expected "
+                f"{expected_bytes:,} bytes, found {actual_bytes:,}. Rebuild the corpus."
+            )
         shards.append(
             MMapShard(
                 path=path,
-                dtype=str(row["dtype"]),
-                record_len=int(row["record_len"]),
+                dtype=dtype,
+                record_len=record_len,
                 records=records,
                 weight=float(row.get("weight", 1.0)),
             )
@@ -1264,6 +1331,16 @@ def _load_mmap_manifest(mmap_dir: str | Path) -> list[MMapShard]:
     if not shards:
         raise ValueError(f"No usable mmap shards found in {manifest_path}")
     return shards
+
+
+def _coprime_stride(records: int, rng: random.Random) -> int:
+    if records <= 2:
+        return 1
+    for _ in range(64):
+        candidate = rng.randrange(1, records)
+        if math.gcd(candidate, records) == 1:
+            return candidate
+    return 1
 
 
 class MMapTokenDataset(IterableDataset):
@@ -1312,13 +1389,22 @@ class MMapTokenDataset(IterableDataset):
             )
             for shard in self.shards
         ]
+        permutation_rng = random.Random(self.seed + 104_729)
+        offsets = [
+            permutation_rng.randrange(shard.records) if shard.records > 1 else 0
+            for shard in self.shards
+        ]
+        strides = [_coprime_stride(shard.records, permutation_rng) for shard in self.shards]
         cursors = [global_worker % shard.records for shard in self.shards]
 
         while True:
             shard_idx = rng.choices(range(len(self.shards)), weights=weights, k=1)[0]
             shard = self.shards[shard_idx]
-            record_idx = cursors[shard_idx]
-            cursors[shard_idx] = (record_idx + total_workers) % shard.records
+            logical_idx = cursors[shard_idx]
+            record_idx = (
+                offsets[shard_idx] + logical_idx * strides[shard_idx]
+            ) % shard.records
+            cursors[shard_idx] = (logical_idx + total_workers) % shard.records
             row = np.asarray(arrays[shard_idx][record_idx], dtype=np.int64)
             yield (
                 torch.from_numpy(row[:-1].copy()),
@@ -1364,8 +1450,13 @@ class MixedTokenDataset(IterableDataset):
     def __iter__(self):
         rng = random.Random(self.seed + self.rank)
         source_iters = {
-            source.name: iter_source_text(source, self.rank, self.world_size)
-            for source in self.sources
+            source.name: iter_source_text(
+                source,
+                self.rank,
+                self.world_size,
+                shuffle_seed=self.seed + 1009 * source_idx,
+            )
+            for source_idx, source in enumerate(self.sources)
         }
         names = [source.name for source in self.sources]
         weights = [source.weight for source in self.sources]

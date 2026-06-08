@@ -165,7 +165,9 @@ def _build_loader(
     world_size: int,
     device: str,
     mix_name: str,
+    seed_offset: int = 0,
 ) -> DataLoader:
+    data_seed = args.seed + 1_000_003 * seed_offset
     if args.data_backend == "mmap":
         if not args.mmap_dir:
             raise ValueError("--mmap-dir is required when --data-backend=mmap")
@@ -174,7 +176,7 @@ def _build_loader(
             args.seq_len,
             rank=rank,
             world_size=world_size,
-            seed=args.seed,
+            seed=data_seed,
         )
     else:
         dataset = MixedTokenDataset(
@@ -183,7 +185,7 @@ def _build_loader(
             get_mix_sources(mix_name),
             rank=rank,
             world_size=world_size,
-            seed=args.seed,
+            seed=data_seed,
             max_sample_chars=args.max_sample_chars,
         )
     return DataLoader(
@@ -1007,6 +1009,7 @@ def main() -> None:
         world_size=world_size,
         device=device,
         mix_name=current_mix,
+        seed_offset=start_step,
     )
 
     global_batch_tokens = world_size * args.micro_batch * args.grad_accum * args.seq_len
@@ -1052,6 +1055,7 @@ def main() -> None:
                 world_size=world_size,
                 device=device,
                 mix_name=current_mix,
+                seed_offset=step,
             )
             data_iter = iter(loader)
             if master:
