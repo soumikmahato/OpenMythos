@@ -77,6 +77,17 @@ class MetaTeridTokenizer:
             for token in METATERID_SPECIAL_TOKENS
         }
 
+    @property
+    def bos_token_id(self) -> int:
+        return int(self.tokenizer.convert_tokens_to_ids("<|bos|>"))
+
+    @property
+    def eos_token_id(self) -> int:
+        return int(self.tokenizer.convert_tokens_to_ids("<|eos|>"))
+
+    def encode_document(self, text: str) -> list[int]:
+        return [self.bos_token_id, *self.encode(text), self.eos_token_id]
+
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 

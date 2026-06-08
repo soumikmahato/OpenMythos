@@ -936,6 +936,111 @@ METATERID_BASE_FINAL_V1_MIX = [
     ),
 ]
 
+METATERID_BASE_WEB_HEAVY_V1_MIX = [
+    DataSource(
+        name="ultrafineweb_en",
+        weight=0.36,
+        dataset="openbmb/Ultra-FineWeb",
+        split="en",
+        text_field="content",
+    ),
+    DataSource(
+        name="filtered_fineweb_edu",
+        weight=0.12,
+        dataset="HuggingFaceFW/fineweb-edu",
+        config="sample-10BT",
+        text_field="text",
+    ),
+    DataSource(
+        name="starcoderdata_python",
+        weight=0.10,
+        dataset="bigcode/starcoderdata",
+        data_dir="python",
+        split="train",
+        text_field="content",
+        fallback=THE_STACK_PYTHON_FALLBACK,
+    ),
+    DataSource(
+        name="starcoderdata_javascript",
+        weight=0.04,
+        dataset="bigcode/starcoderdata",
+        data_dir="javascript",
+        split="train",
+        text_field="content",
+        fallback=THE_STACK_JAVASCRIPT_FALLBACK,
+    ),
+    DataSource(
+        name="math_stem_openwebmath",
+        weight=0.07,
+        dataset="open-web-math/open-web-math",
+        split="train",
+        text_field="text",
+    ),
+    DataSource(
+        name="ultradata_math_l3_qa",
+        weight=0.07,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_math_l3_textbook",
+        weight=0.03,
+        dataset="openbmb/UltraData-Math",
+        config="UltraData-Math-L3-Textbook-Exercise-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_multistyle_en",
+        weight=0.04,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultrafineweb_l3_qa_en",
+        weight=0.04,
+        dataset="openbmb/Ultra-FineWeb-L3",
+        config="Ultra-FineWeb-L3-en-QA-Synthetic",
+        split="train",
+        text_field="content",
+    ),
+    DataSource(
+        name="ultradata_sft_code_no_think",
+        weight=0.040,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Code",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_math_no_think",
+        weight=0.025,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="Math",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="ultradata_sft_if_no_think",
+        weight=0.020,
+        dataset="openbmb/UltraData-SFT-2605",
+        config="IF",
+        split="no_think",
+        formatter="auto",
+    ),
+    DataSource(
+        name="tool_chat_hermes_function_calling",
+        weight=0.045,
+        dataset="NousResearch/hermes-function-calling-v1",
+        split="train",
+        formatter="auto",
+    ),
+]
+
 
 MIX_PRESETS = {
     "pilot": METATERID_T4_PILOT_MIX,
@@ -954,6 +1059,7 @@ MIX_PRESETS = {
     "main_base_first_v1": METATERID_BASE_FIRST_V1_MIX,
     "main_base_middle_v1": METATERID_BASE_MIDDLE_V1_MIX,
     "main_base_final_v1": METATERID_BASE_FINAL_V1_MIX,
+    "main_base_web_heavy_v1": METATERID_BASE_WEB_HEAVY_V1_MIX,
     "main_smoke_50m_v1": METATERID_BASE_FIRST_V1_MIX,
     "main_stable_web": METATERID_MAIN_STABLE_WEB_MIX,
     "main_reasoning_bootstrap": METATERID_MAIN_REASONING_BOOTSTRAP_MIX,
@@ -1275,7 +1381,10 @@ class MixedTokenDataset(IterableDataset):
                 continue
 
             text = self._bounded_text(text, rng)
-            buf.extend(self.tokenizer.encode(text))
+            if hasattr(self.tokenizer, "encode_document"):
+                buf.extend(self.tokenizer.encode_document(text))
+            else:
+                buf.extend(self.tokenizer.encode(text))
             while len(buf) >= self.seq_len + 1:
                 chunk = buf[: self.seq_len + 1]
                 buf = buf[self.seq_len + 1 :]

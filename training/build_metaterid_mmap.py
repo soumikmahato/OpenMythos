@@ -80,7 +80,7 @@ def _build_one(args: argparse.Namespace, tokenizer: MetaTeridTokenizer, mix_name
             for text in iter_source_text(source, args.rank, args.world_size):
                 if args.max_sample_chars > 0 and len(text) > args.max_sample_chars:
                     text = text[: args.max_sample_chars]
-                buf.extend(tokenizer.encode(text))
+                buf.extend(tokenizer.encode_document(text))
                 while len(buf) >= record_len and records < args.records_per_source:
                     row = np.asarray(buf[:record_len], dtype=dtype)
                     row.tofile(handle)
